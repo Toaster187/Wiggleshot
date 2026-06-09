@@ -69,6 +69,7 @@ import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.Executor
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -294,6 +295,9 @@ fun PreviewAndControlLayout(
     var activeCaptureB by remember { mutableStateOf<ImageCapture?>(null) }
     
     var isCapturing by remember { mutableStateOf(false) }
+    var cameraXPairReady by remember { mutableStateOf(false) }
+    var cameraRestartToken by remember { mutableStateOf(0) }
+    var stillCountdown by remember { mutableStateOf<Int?>(null) }
     val mainExecutor = androidx.core.content.ContextCompat.getMainExecutor(context)
 
     // For DualCameraManager on API >= 28
@@ -325,11 +329,16 @@ fun PreviewAndControlLayout(
         }
     }
 
-    DisposableEffect(uiState.primaryLens, uiState.secondaryLens, isResumed) {
+    DisposableEffect(uiState.primaryLens, uiState.secondaryLens, isResumed, cameraRestartToken) {
         val primary = uiState.primaryLens
         val secondary = uiState.secondaryLens
 
         if (isResumed && primary != null && secondary != null) {
+            cameraXPairReady = false
+            activeCaptureA = null
+            activeCaptureB = null
+            cameraControlA = null
+            cameraControlB = null
             val logicalIdA = primary.parentLogicalId ?: primary.id
             val logicalIdB = secondary.parentLogicalId ?: secondary.id
 
@@ -436,9 +445,6 @@ fun PreviewAndControlLayout(
                     }
                     val capB = builderB.build()
 
-                    activeCaptureA = capA
-                    activeCaptureB = capB
-
                     val cameraSelectorA = findCameraSelector(cameraProvider, logicalIdA)
                     val previewBuilderA = Preview.Builder().setTargetAspectRatio(androidx.camera.core.AspectRatio.RATIO_4_3).apply {
                         if (primary.parentLogicalId != null && android.os.Build.VERSION.SDK_INT >= 28) {
@@ -450,9 +456,10 @@ fun PreviewAndControlLayout(
                         val cameraA = cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelectorA, previewBuilderA, capA)
                         previewBuilderA.setSurfaceProvider(previewViewA.surfaceProvider)
                         cameraControlA = cameraA.cameraControl
+                        activeCaptureA = capA
                     } catch (e: Exception) { Log.e("CameraBinding", "Failed A", e) }
 
-                    if (logicalIdA != logicalIdB) {
+                    if (logicalIdA != logicalIdB && uiState.concurrentPreviewSupported) {
                         val cameraSelectorB = findCameraSelector(cameraProvider, logicalIdB)
                         val previewBuilderB = Preview.Builder().setTargetAspectRatio(androidx.camera.core.AspectRatio.RATIO_4_3).apply {
                             if (secondary.parentLogicalId != null && android.os.Build.VERSION.SDK_INT >= 28) {
@@ -464,11 +471,11 @@ fun PreviewAndControlLayout(
                             val cameraB = cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelectorB, previewBuilderB, capB)
                             previewBuilderB.setSurfaceProvider(previewViewB.surfaceProvider)
                             cameraControlB = cameraB.cameraControl
+                            activeCaptureB = capB
+                            cameraXPairReady = true
                         } catch (e: Exception) { Log.e("CameraBinding", "Failed B", e) }
                     } else {
-                        // We cannot bind B if it's the exact same logical camera and uses CameraX.
-                        // We'll just leave B empty if DualCameraManager didn't catch it
-                        Log.e("CameraBinding", "Cannot bind two previews to same logical camera in CameraX fallback.")
+                        Log.d("CameraBinding", "Using sequential capture fallback for secondary lens.")
                     }
 
                 } catch (e: Exception) {
@@ -480,152 +487,158 @@ fun PreviewAndControlLayout(
         onDispose {
             dualManager?.stop()
             dualManager = null
+            cameraXPairReady = false
         }
     }
     
     val coroutineScope = rememberCoroutineScope()
-    
-    val executeCapture = remember(usingDualManager, dualManager, activeCaptureA, activeCaptureB, uiState, previewViewA, previewViewB, textureViewA, textureViewB) {
-        {
-            if (!isCapturing && !uiState.isCapturing) {
-                isCapturing = true
-                
-                if (uiState.lensCount == 2) {
-                    if (usingDualManager && dualManager != null) {
-                        dualManager?.takePicture()
-                    } else {
-                        val cA = activeCaptureA
-                        val cB = activeCaptureB
-                        
-                        if (cA != null && cB != null) {
-                            var bitmapA: Bitmap? = null
-                            var bitmapB: Bitmap? = null
-                            
-                            val checkComplete = {
-                                if (bitmapA != null && bitmapB != null) {
-                                    onCapture(bitmapA, bitmapB)
-                                    isCapturing = false
-                                }
-                            }
 
-                            cA.takePicture(mainExecutor, object : ImageCapture.OnImageCapturedCallback() {
-                                override fun onCaptureSuccess(image: ImageProxy) {
-                                    val matrix = android.graphics.Matrix()
-                                    matrix.postRotate(image.imageInfo.rotationDegrees.toFloat())
-                                    
-                                    val buffer = image.planes[0].buffer
-                                    val bytes = ByteArray(buffer.remaining())
-                                    buffer.get(bytes)
-                                    val tempBitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                                    
-                                    val crop = image.cropRect
-                                    val scaleX = tempBitmap.width.toFloat() / image.width.toFloat()
-                                    val scaleY = tempBitmap.height.toFloat() / image.height.toFloat()
-                                    
-                                    val cw = (crop.width() * scaleX).toInt().coerceAtMost(tempBitmap.width)
-                                    val ch = (crop.height() * scaleY).toInt().coerceAtMost(tempBitmap.height)
-                                    val cx = (crop.left * scaleX).toInt().coerceAtMost(tempBitmap.width - cw)
-                                    val cy = (crop.top * scaleY).toInt().coerceAtMost(tempBitmap.height - ch)
-                                    
-                                    matrix.postScale(tempBitmap.width.toFloat() / cw, tempBitmap.height.toFloat() / ch)
-                                    
-                                    bitmapA = android.graphics.Bitmap.createBitmap(
-                                        tempBitmap, cx, cy, cw, ch, matrix, true
-                                    )
-                                    image.close()
-                                    checkComplete()
-                                }
-                                override fun onError(exception: ImageCaptureException) {
-                                    Log.e("Wiggle", "Capture A failed", exception)
-                                    isCapturing = false
-                                }
-                            })
-                            
-                            cB.takePicture(mainExecutor, object : ImageCapture.OnImageCapturedCallback() {
-                                override fun onCaptureSuccess(image: ImageProxy) {
-                                    val matrix = android.graphics.Matrix()
-                                    matrix.postRotate(image.imageInfo.rotationDegrees.toFloat())
-                                    
-                                    val buffer = image.planes[0].buffer
-                                    val bytes = ByteArray(buffer.remaining())
-                                    buffer.get(bytes)
-                                    val tempBitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                                    
-                                    val crop = image.cropRect
-                                    val scaleX = tempBitmap.width.toFloat() / image.width.toFloat()
-                                    val scaleY = tempBitmap.height.toFloat() / image.height.toFloat()
-                                    
-                                    val cw = (crop.width() * scaleX).toInt().coerceAtMost(tempBitmap.width)
-                                    val ch = (crop.height() * scaleY).toInt().coerceAtMost(tempBitmap.height)
-                                    val cx = (crop.left * scaleX).toInt().coerceAtMost(tempBitmap.width - cw)
-                                    val cy = (crop.top * scaleY).toInt().coerceAtMost(tempBitmap.height - ch)
-                                    
-                                    matrix.postScale(tempBitmap.width.toFloat() / cw, tempBitmap.height.toFloat() / ch)
-                                    
-                                    bitmapB = android.graphics.Bitmap.createBitmap(
-                                        tempBitmap, cx, cy, cw, ch, matrix, true
-                                    )
-                                    image.close()
-                                    checkComplete()
-                                }
-                                override fun onError(exception: ImageCaptureException) {
-                                    Log.e("Wiggle", "Capture B failed", exception)
-                                    isCapturing = false
-                                }
-                            })
-                        } else {
-                            Toast.makeText(context, "Kameras nicht bereit", Toast.LENGTH_SHORT).show()
+    suspend fun runStillCountdown() {
+        for (count in 3 downTo 1) {
+            stillCountdown = count
+            delay(700)
+        }
+        stillCountdown = 0
+        delay(180)
+    }
+
+    suspend fun captureSelectedLensesSequentially(): List<Bitmap> {
+        val selectedLenses = mutableListOf<CameraLensDetails>()
+        uiState.primaryLens?.let { selectedLenses.add(it) }
+        if (uiState.lensCount <= 2) {
+            uiState.secondaryLens?.let { selectedLenses.add(it) }
+        } else {
+            selectedLenses.addAll(uiState.secondaryLenses)
+        }
+
+        val capturedBitmaps = mutableListOf<Bitmap>()
+        val uniqueLenses = selectedLenses.distinctBy { it.id }
+        for ((index, lens) in uniqueLenses.withIndex()) {
+            val limits = uiState.zoomLimitsMap[lens.id] ?: Pair(1f, 3f)
+            val zoom = (uiState.zoomMap[lens.id] ?: 1f).coerceIn(limits.first, limits.second)
+            val bitmap = try {
+                if (index == 0 && lens.id == uiState.primaryLens?.id && activeCaptureA != null) {
+                    val activePrimaryBitmap = try {
+                        try {
+                            cameraControlA?.setZoomRatio(zoom)?.await(context)
+                        } catch (e: Exception) {
+                            Log.w("WiggleApp", "Could not apply primary zoom before sequential capture", e)
+                        }
+                        captureCameraXBitmap(activeCaptureA!!, mainExecutor)
+                    } catch (e: Exception) {
+                        Log.w("WiggleApp", "Active primary capture failed; rebinding lens ${lens.id}", e)
+                        null
+                    }
+                    activePrimaryBitmap ?: captureLensStillFrame(
+                        context = context,
+                        lifecycleOwner = lifecycleOwner,
+                        previewView = previewViewA,
+                        lens = lens,
+                        zoom = zoom,
+                        mainExecutor = mainExecutor,
+                        settleDelayMs = 220L
+                    )
+                } else {
+                    captureLensStillFrame(
+                        context = context,
+                        lifecycleOwner = lifecycleOwner,
+                        previewView = previewViewA,
+                        lens = lens,
+                        zoom = zoom,
+                        mainExecutor = mainExecutor,
+                        settleDelayMs = if (index == 0) 220L else 140L
+                    )
+                }
+            } catch (e: Exception) {
+                Log.e("WiggleApp", "Sequential capture failed for lens ${lens.id}", e)
+                null
+            }
+
+            if (bitmap != null) {
+                capturedBitmaps.add(bitmap)
+            } else {
+                Log.e("WiggleApp", "Sequential capture returned no bitmap for lens ${lens.id}")
+            }
+        }
+        return capturedBitmaps
+    }
+
+    val executeCapture = {
+        if (!isCapturing && !uiState.isCapturing) {
+            isCapturing = true
+
+            val canUseDualManager = uiState.lensCount == 2 && usingDualManager && dualManager != null
+            val canUseCameraXPair = uiState.lensCount == 2 && !usingDualManager && cameraXPairReady && activeCaptureA != null && activeCaptureB != null
+
+            if (canUseDualManager) {
+                dualManager?.takePicture()
+            } else if (canUseCameraXPair) {
+                val cA = activeCaptureA
+                val cB = activeCaptureB
+
+                if (cA != null && cB != null) {
+                    var bitmapA: Bitmap? = null
+                    var bitmapB: Bitmap? = null
+
+                    val checkComplete = {
+                        if (bitmapA != null && bitmapB != null) {
+                            onCapture(bitmapA, bitmapB)
                             isCapturing = false
                         }
                     }
-                } else {
-                    // Sequential Multi-Camera Capture (3 or 4 Lenses)
-                    coroutineScope.launch {
-                        try {
-                            val capturedBitmaps = mutableListOf<Bitmap>()
-                            
-                            // 1. Grab Primary Lens Frame
-                            val bmpPrimary = if (usingDualManager) {
-                                textureViewA.getBitmap(textureViewA.width, textureViewA.height) ?: textureViewA.bitmap
-                            } else {
-                                previewViewA.bitmap
+
+                    cA.takePicture(mainExecutor, object : ImageCapture.OnImageCapturedCallback() {
+                        override fun onCaptureSuccess(image: ImageProxy) {
+                            try {
+                                bitmapA = imageProxyToBitmap(image)
+                                checkComplete()
+                            } finally {
+                                image.close()
                             }
-                            if (bmpPrimary != null) {
-                                capturedBitmaps.add(bmpPrimary)
-                            }
-                            
-                            // 2. Grab Secondary Lenses Sequentially
-                            val originalSelection = uiState.secondaryLenses
-                            
-                            for (lens in originalSelection) {
-                                viewModel.setSecondaryLens(lens)
-                                kotlinx.coroutines.delay(300) // Settle delay
-                                
-                                val bmpSecondary = if (usingDualManager) {
-                                    textureViewB.getBitmap(textureViewB.width, textureViewB.height) ?: textureViewB.bitmap
-                                } else {
-                                    previewViewB.bitmap
-                                }
-                                if (bmpSecondary != null) {
-                                    capturedBitmaps.add(bmpSecondary)
-                                }
-                            }
-                            
-                            // Restore original selection
-                            if (originalSelection.isNotEmpty()) {
-                                viewModel.setSecondaryLens(originalSelection.first())
-                            }
-                            
-                            if (capturedBitmaps.isNotEmpty()) {
-                                viewModel.performMultiCapture(context, capturedBitmaps)
-                            } else {
-                                Toast.makeText(context, "Aufnahme fehlgeschlagen", Toast.LENGTH_SHORT).show()
-                            }
-                        } catch (e: Exception) {
-                            Log.e("WiggleApp", "Sequential capture failed", e)
-                        } finally {
+                        }
+
+                        override fun onError(exception: ImageCaptureException) {
+                            Log.e("Wiggle", "Capture A failed", exception)
                             isCapturing = false
                         }
+                    })
+
+                    cB.takePicture(mainExecutor, object : ImageCapture.OnImageCapturedCallback() {
+                        override fun onCaptureSuccess(image: ImageProxy) {
+                            try {
+                                bitmapB = imageProxyToBitmap(image)
+                                checkComplete()
+                            } finally {
+                                image.close()
+                            }
+                        }
+
+                        override fun onError(exception: ImageCaptureException) {
+                            Log.e("Wiggle", "Capture B failed", exception)
+                            isCapturing = false
+                        }
+                    })
+                } else {
+                    Toast.makeText(context, "Kameras nicht bereit", Toast.LENGTH_SHORT).show()
+                    isCapturing = false
+                }
+            } else {
+                coroutineScope.launch {
+                    try {
+                        runStillCountdown()
+                        val capturedBitmaps = captureSelectedLensesSequentially()
+                        if (capturedBitmaps.size >= 2) {
+                            viewModel.performMultiCapture(context, capturedBitmaps)
+                        } else {
+                            Toast.makeText(context, "Aufnahme fehlgeschlagen", Toast.LENGTH_SHORT).show()
+                        }
+                    } catch (e: Exception) {
+                        Log.e("WiggleApp", "Sequential capture failed", e)
+                        Toast.makeText(context, "Aufnahme fehlgeschlagen", Toast.LENGTH_SHORT).show()
+                    } finally {
+                        stillCountdown = null
+                        isCapturing = false
+                        cameraRestartToken += 1
                     }
                 }
             }
@@ -668,6 +681,33 @@ fun PreviewAndControlLayout(
                 modifier = Modifier.fillMaxSize().alpha(if (!usingDualManager) 1f else 0f)
             )
         }
+
+        if (stillCountdown != null) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color(0xAA000000)),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        text = if (stillCountdown == 0) "JETZT STILL" else stillCountdown.toString(),
+                        fontSize = if (stillCountdown == 0) 30.sp else 64.sp,
+                        fontWeight = FontWeight.Black,
+                        color = Color.White,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text(
+                        text = "Bitte ganz ruhig halten",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF00FFCC),
+                        textAlign = TextAlign.Center
+                    )
+                }
+            }
+        }
         
         // Camera Mode Indicator Pill Top Left
         Box(
@@ -679,14 +719,15 @@ fun PreviewAndControlLayout(
                 .padding(horizontal = 12.dp, vertical = 8.dp)
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
+                val simultaneousReady = uiState.lensCount == 2 && ((usingDualManager && dualManager != null) || cameraXPairReady)
                 Box(
                     modifier = Modifier
                         .size(8.dp)
-                        .background(if (uiState.lensCount == 2) Color(0xFF00FFCC) else Color(0xFFFFCC00), CircleShape)
+                        .background(if (simultaneousReady) Color(0xFF00FFCC) else Color(0xFFFFCC00), CircleShape)
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
-                    text = if (uiState.lensCount == 2) "SIMULTAN (2 Linsen)" else "SEQUENTIELL (${uiState.lensCount} Linsen)",
+                    text = if (simultaneousReady) "SIMULTAN (2 Linsen)" else "SEQUENTIELL (${uiState.lensCount} Linsen)",
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Black,
                     color = Color.White,
@@ -816,35 +857,56 @@ fun PreviewAndControlLayout(
                         .clickable(enabled = !uiState.isCalibrating) {
                             coroutineScope.launch {
                                 viewModel.setCalibrating(true)
+                                var restartCameraAfterCalibration = false
                                 try {
                                     val results = mutableMapOf<String, MutableList<Float>>()
                                     val originalSecondary = uiState.secondaryLens
                                     val originalZoomB = uiState.zoomB
+                                    val primaryLens = uiState.primaryLens
+                                    val useSequentialCalibration = !usingDualManager && !cameraXPairReady
+                                    restartCameraAfterCalibration = useSequentialCalibration
                                     
                                     // Loop through all secondary lenses
                                     for (lens in uiState.secondaryLenses) {
                                         if (uiState.secondaryLens?.id != lens.id) {
                                             viewModel.setSecondaryLens(lens)
-                                            delay(2000) // Give more time for the new camera session to start
+                                            delay(if (useSequentialCalibration) 150 else 2000)
                                         }
                                         
                                         val limits = uiState.zoomLimitsMap[lens.id] ?: Pair(1.0f, 3.0f)
                                         val minZoom = limits.first.coerceAtLeast(1.0f)
                                         val maxZoom = limits.second
+                                        val passes = if (useSequentialCalibration) 2 else 5
                                         
-                                        // Run ZNCC visual matching 5 times and collect results
-                                        for (i in 0 until 5) {
+                                        // Run visual matching multiple times and collect results
+                                        for (i in 0 until passes) {
                                             // Take fresh frames inside the loop to get different real-time images
-                                            val bmpPrimary = if (usingDualManager) {
-                                                textureViewA.getBitmap(640, 480)
-                                            } else {
-                                                previewViewA.bitmap
+                                            val bmpPrimary = when {
+                                                usingDualManager -> textureViewA.getBitmap(640, 480)
+                                                useSequentialCalibration && primaryLens != null -> captureLensStillFrame(
+                                                    context = context,
+                                                    lifecycleOwner = lifecycleOwner,
+                                                    previewView = previewViewA,
+                                                    lens = primaryLens,
+                                                    zoom = uiState.zoomMap[primaryLens.id] ?: 1f,
+                                                    mainExecutor = mainExecutor,
+                                                    settleDelayMs = 160L
+                                                )
+                                                else -> previewViewA.bitmap
                                             }
                                             
-                                            val bmpSecondary = if (usingDualManager) {
-                                                textureViewB.getBitmap(640, 480)
-                                            } else {
-                                                previewViewB.bitmap
+                                            val bmpSecondary = when {
+                                                usingDualManager -> textureViewB.getBitmap(640, 480)
+                                                useSequentialCalibration -> captureLensStillFrame(
+                                                    context = context,
+                                                    lifecycleOwner = lifecycleOwner,
+                                                    previewView = previewViewA,
+                                                    lens = lens,
+                                                    zoom = minZoom,
+                                                    mainExecutor = mainExecutor,
+                                                    settleDelayMs = 140L
+                                                )
+                                                else -> previewViewB.bitmap
                                             }
                                             
                                             if (bmpPrimary != null && bmpSecondary != null && bmpSecondary.width > 50 && bmpSecondary.height > 50) {
@@ -854,8 +916,8 @@ fun PreviewAndControlLayout(
                                                 android.util.Log.e("WiggleApp", "Cannot calibrate iteration $i for lens ${lens.id}: bmpPrimary=$bmpPrimary, bmpSecondary=$bmpSecondary")
                                             }
                                             
-                                            if (i < 4) {
-                                                delay(150) // Wait a brief period to get a fresh frame
+                                            if (i < passes - 1) {
+                                                delay(if (useSequentialCalibration) 80 else 150)
                                             }
                                         }
                                     }
@@ -871,6 +933,10 @@ fun PreviewAndControlLayout(
                                 } catch (e: Exception) {
                                     android.util.Log.e("WiggleApp", "Error during ML calibration", e)
                                     viewModel.setCalibrating(false)
+                                } finally {
+                                    if (restartCameraAfterCalibration) {
+                                        cameraRestartToken += 1
+                                    }
                                 }
                             }
                         }
@@ -1003,6 +1069,105 @@ class ZoomableTextureView(context: Context) : android.view.TextureView(context) 
             updateTextureViewTransform(this, lastWidth, lastHeight, currentZoom, sensorOrientation)
         }
     }
+}
+
+private suspend fun captureLensStillFrame(
+    context: Context,
+    lifecycleOwner: androidx.lifecycle.LifecycleOwner,
+    previewView: PreviewView,
+    lens: CameraLensDetails,
+    zoom: Float,
+    mainExecutor: Executor,
+    settleDelayMs: Long
+): Bitmap? {
+    val cameraProvider = ProcessCameraProvider.getInstance(context).await(context)
+    cameraProvider.unbindAll()
+
+    val logicalId = lens.parentLogicalId ?: lens.id
+    val imageCaptureBuilder = ImageCapture.Builder()
+        .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+        .setTargetAspectRatio(androidx.camera.core.AspectRatio.RATIO_4_3)
+    if (lens.parentLogicalId != null && android.os.Build.VERSION.SDK_INT >= 28) {
+        androidx.camera.camera2.interop.Camera2Interop.Extender(imageCaptureBuilder)
+            .setPhysicalCameraId(lens.id)
+    }
+    val imageCapture = imageCaptureBuilder.build()
+
+    val previewBuilder = Preview.Builder()
+        .setTargetAspectRatio(androidx.camera.core.AspectRatio.RATIO_4_3)
+    if (lens.parentLogicalId != null && android.os.Build.VERSION.SDK_INT >= 28) {
+        androidx.camera.camera2.interop.Camera2Interop.Extender(previewBuilder)
+            .setPhysicalCameraId(lens.id)
+    }
+    val preview = previewBuilder.build()
+    preview.setSurfaceProvider(previewView.surfaceProvider)
+
+    val cameraSelector = findCameraSelector(cameraProvider, logicalId)
+    val camera = cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, imageCapture)
+    try {
+        camera.cameraControl.setZoomRatio(zoom).await(context)
+    } catch (e: Exception) {
+        Log.w("WiggleApp", "Could not apply zoom before sequential lens capture", e)
+    }
+    delay(settleDelayMs)
+
+    return captureCameraXBitmap(imageCapture, mainExecutor)
+}
+
+private suspend fun captureCameraXBitmap(
+    imageCapture: ImageCapture,
+    mainExecutor: Executor
+): Bitmap? {
+    return kotlinx.coroutines.suspendCancellableCoroutine { continuation ->
+        imageCapture.takePicture(mainExecutor, object : ImageCapture.OnImageCapturedCallback() {
+            override fun onCaptureSuccess(image: ImageProxy) {
+                try {
+                    continuation.resumeWith(Result.success(imageProxyToBitmap(image)))
+                } catch (e: Exception) {
+                    continuation.resumeWith(Result.failure(e))
+                } finally {
+                    image.close()
+                }
+            }
+
+            override fun onError(exception: ImageCaptureException) {
+                continuation.resumeWith(Result.failure(exception))
+            }
+        })
+    }
+}
+
+private fun imageProxyToBitmap(image: ImageProxy): Bitmap? {
+    val buffer = image.planes[0].buffer
+    val bytes = ByteArray(buffer.remaining())
+    buffer.get(bytes)
+    val tempBitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+
+    val crop = image.cropRect
+    val scaleX = tempBitmap.width.toFloat() / image.width.toFloat()
+    val scaleY = tempBitmap.height.toFloat() / image.height.toFloat()
+
+    val cropWidth = (crop.width() * scaleX).toInt().coerceIn(1, tempBitmap.width)
+    val cropHeight = (crop.height() * scaleY).toInt().coerceIn(1, tempBitmap.height)
+    val cropX = (crop.left * scaleX).toInt().coerceIn(0, tempBitmap.width - cropWidth)
+    val cropY = (crop.top * scaleY).toInt().coerceIn(0, tempBitmap.height - cropHeight)
+
+    val matrix = android.graphics.Matrix()
+    matrix.postRotate(image.imageInfo.rotationDegrees.toFloat())
+    matrix.postScale(
+        tempBitmap.width.toFloat() / cropWidth,
+        tempBitmap.height.toFloat() / cropHeight
+    )
+
+    return android.graphics.Bitmap.createBitmap(
+        tempBitmap,
+        cropX,
+        cropY,
+        cropWidth,
+        cropHeight,
+        matrix,
+        true
+    )
 }
 
 private fun findCameraSelector(cameraProvider: ProcessCameraProvider, cameraId: String): CameraSelector {

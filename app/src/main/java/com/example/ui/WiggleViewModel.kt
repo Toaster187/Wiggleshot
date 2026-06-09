@@ -13,6 +13,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.example.data.WiggleCapture
 import com.example.data.WiggleRepository
+import com.example.util.VisualZoomMatcher
 import com.example.util.WiggleProcessor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -257,111 +258,8 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
         minZoom: Float,
         maxZoom: Float
     ): Float = withContext(Dispatchers.Default) {
-        val wA = bmpA.width
-        val hA = bmpA.height
-        val wB = bmpB.width
-        val hB = bmpB.height
-        
-        Log.d(TAG, "Visual ZNCC match: A=${wA}x${hA}, B=${wB}x${hB}, range=[$minZoom, $maxZoom]")
-        
-        // Read all pixels from both images upfront (fast bulk read)
-        val allPixelsA = IntArray(wA * hA)
-        bmpA.getPixels(allPixelsA, 0, wA, 0, 0, wA, hA)
-        val allPixelsB = IntArray(wB * hB)
-        bmpB.getPixels(allPixelsB, 0, wB, 0, 0, wB, hB)
-        
-        // Comparison grid: 64x64 = 4096 sample points per zoom level
-        val gridSize = 64
-        
-        // Reference region: center 50% of image A
-        val refSize = minOf(wA, hA) / 2
-        val refX0 = (wA - refSize) / 2
-        val refY0 = (hA - refSize) / 2
-        
-        // Sample A's center into luminance array
-        val lumA = FloatArray(gridSize * gridSize)
-        var sumA = 0.0
-        for (gy in 0 until gridSize) {
-            for (gx in 0 until gridSize) {
-                val ax = refX0 + (gx * refSize) / gridSize
-                val ay = refY0 + (gy * refSize) / gridSize
-                val c = allPixelsA[ay * wA + ax]
-                val l = ((c shr 16) and 0xFF) * 0.299f + ((c shr 8) and 0xFF) * 0.587f + (c and 0xFF) * 0.114f
-                lumA[gy * gridSize + gx] = l
-                sumA += l
-            }
-        }
-        val meanA = (sumA / lumA.size).toFloat()
-        
-        // Precompute A's variance
-        var varSumA = 0.0
-        for (l in lumA) {
-            val d = (l - meanA).toDouble()
-            varSumA += d * d
-        }
-        
-        var bestZoom = minZoom
-        var maxScore = -2.0f
-        
-        // Search zoom from minZoom to maxZoom in steps of 0.01
-        val minZi = (minZoom * 100).toInt()
-        val maxZi = (maxZoom * 100).toInt()
-        
-        for (zi in minZi..maxZi) {
-            val zoom = zi / 100.0f
-            
-            // At this zoom level, the visible crop of B is:
-            val cropW = (wB / zoom).toInt()
-            val cropH = (hB / zoom).toInt()
-            if (cropW < 20 || cropH < 20) continue
-            
-            val cx0 = (wB - cropW) / 2
-            val cy0 = (hB - cropH) / 2
-            
-            // Take center 50% of B's crop (matching A's center 50% strategy)
-            val innerSize = minOf(cropW, cropH) / 2
-            if (innerSize < 10) continue
-            val ix0 = cx0 + (cropW - innerSize) / 2
-            val iy0 = cy0 + (cropH - innerSize) / 2
-            
-            // Sample B's region into luminance array
-            val lumB = FloatArray(gridSize * gridSize)
-            var sumB = 0.0
-            for (gy in 0 until gridSize) {
-                for (gx in 0 until gridSize) {
-                    val bx = ix0 + (gx * innerSize) / gridSize
-                    val by = iy0 + (gy * innerSize) / gridSize
-                    if (bx in 0 until wB && by in 0 until hB) {
-                        val c = allPixelsB[by * wB + bx]
-                        val l = ((c shr 16) and 0xFF) * 0.299f + ((c shr 8) and 0xFF) * 0.587f + (c and 0xFF) * 0.114f
-                        lumB[gy * gridSize + gx] = l
-                        sumB += l
-                    }
-                }
-            }
-            val meanB = (sumB / lumB.size).toFloat()
-            
-            // Compute ZNCC (zero-mean normalized cross-correlation)
-            var crossSum = 0.0
-            var varSumB = 0.0
-            for (i in lumA.indices) {
-                val dA = (lumA[i] - meanA).toDouble()
-                val dB = (lumB[i] - meanB).toDouble()
-                crossSum += dA * dB
-                varSumB += dB * dB
-            }
-            
-            val den = Math.sqrt(varSumA * varSumB)
-            val score = if (den > 0) (crossSum / den).toFloat() else 0f
-            
-            if (score > maxScore) {
-                maxScore = score
-                bestZoom = zoom
-            }
-        }
-        
-        Log.d(TAG, "Visual zoom match complete: bestZoom=$bestZoom, score=$maxScore")
-        bestZoom
+        Log.d(TAG, "Visual zoom match: A=${bmpA.width}x${bmpA.height}, B=${bmpB.width}x${bmpB.height}, range=[$minZoom, $maxZoom]")
+        VisualZoomMatcher.calculate(bmpA, bmpB, minZoom, maxZoom)
     }
 
     fun applyCalibrationResults(results: Map<String, List<Float>>) {
