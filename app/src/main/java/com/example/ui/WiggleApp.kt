@@ -876,7 +876,18 @@ fun PreviewAndControlLayout(
                                         val limits = uiState.zoomLimitsMap[lens.id] ?: Pair(1.0f, 3.0f)
                                         val minZoom = limits.first.coerceAtLeast(1.0f)
                                         val maxZoom = limits.second
-                                        val passes = if (useSequentialCalibration) 2 else 5
+                                        val passes = if (useSequentialCalibration) 3 else 5
+
+                                        if (!useSequentialCalibration) {
+                                            // Reset the secondary to its baseline zoom before sampling
+                                            // frames. Otherwise the captured frame is already zoomed by
+                                            // the current zoomB (preview transform / sensor crop) and the
+                                            // calibration result would depend on the previous zoom state,
+                                            // producing different results on every run. Also give the
+                                            // 3A loops (AE/AWB) time to settle before grabbing frames.
+                                            viewModel.setZoomB(minZoom)
+                                            delay(900)
+                                        }
                                         
                                         // Run visual matching multiple times and collect results
                                         for (i in 0 until passes) {
@@ -890,7 +901,7 @@ fun PreviewAndControlLayout(
                                                     lens = primaryLens,
                                                     zoom = uiState.zoomMap[primaryLens.id] ?: 1f,
                                                     mainExecutor = mainExecutor,
-                                                    settleDelayMs = 160L
+                                                    settleDelayMs = 250L
                                                 )
                                                 else -> previewViewA.bitmap
                                             }
@@ -904,7 +915,7 @@ fun PreviewAndControlLayout(
                                                     lens = lens,
                                                     zoom = minZoom,
                                                     mainExecutor = mainExecutor,
-                                                    settleDelayMs = 140L
+                                                    settleDelayMs = 250L
                                                 )
                                                 else -> previewViewB.bitmap
                                             }
@@ -917,7 +928,7 @@ fun PreviewAndControlLayout(
                                             }
                                             
                                             if (i < passes - 1) {
-                                                delay(if (useSequentialCalibration) 80 else 150)
+                                                delay(if (useSequentialCalibration) 120 else 250)
                                             }
                                         }
                                     }
@@ -1095,10 +1106,45 @@ private suspend fun captureLensStillFrame(
 
     val previewBuilder = Preview.Builder()
         .setTargetAspectRatio(androidx.camera.core.AspectRatio.RATIO_4_3)
+    val previewExtender = androidx.camera.camera2.interop.Camera2Interop.Extender(previewBuilder)
     if (lens.parentLogicalId != null && android.os.Build.VERSION.SDK_INT >= 28) {
-        androidx.camera.camera2.interop.Camera2Interop.Extender(previewBuilder)
-            .setPhysicalCameraId(lens.id)
+        previewExtender.setPhysicalCameraId(lens.id)
     }
+
+    // After a full unbind/rebind the auto-exposure and auto-white-balance loops
+    // restart from scratch. Capturing a calibration frame before 3A has
+    // converged yields frames with unpredictable brightness, which makes the
+    // ZNCC zoom match non-deterministic across app starts. Monitor the preview
+    // capture results and wait until AE + AWB report a stable state.
+    val converged = kotlinx.coroutines.CompletableDeferred<Unit>()
+    var stableFrames = 0
+    previewExtender.setSessionCaptureCallback(
+        object : android.hardware.camera2.CameraCaptureSession.CaptureCallback() {
+            override fun onCaptureCompleted(
+                session: android.hardware.camera2.CameraCaptureSession,
+                request: android.hardware.camera2.CaptureRequest,
+                result: android.hardware.camera2.TotalCaptureResult
+            ) {
+                val aeState = result.get(android.hardware.camera2.CaptureResult.CONTROL_AE_STATE)
+                val awbState = result.get(android.hardware.camera2.CaptureResult.CONTROL_AWB_STATE)
+                val aeStable = aeState == null ||
+                    aeState == android.hardware.camera2.CaptureResult.CONTROL_AE_STATE_CONVERGED ||
+                    aeState == android.hardware.camera2.CaptureResult.CONTROL_AE_STATE_LOCKED ||
+                    aeState == android.hardware.camera2.CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED
+                val awbStable = awbState == null ||
+                    awbState == android.hardware.camera2.CaptureResult.CONTROL_AWB_STATE_CONVERGED ||
+                    awbState == android.hardware.camera2.CaptureResult.CONTROL_AWB_STATE_LOCKED
+                if (aeStable && awbStable) {
+                    stableFrames += 1
+                    if (stableFrames >= AE_STABLE_FRAME_COUNT && !converged.isCompleted) {
+                        converged.complete(Unit)
+                    }
+                } else {
+                    stableFrames = 0
+                }
+            }
+        }
+    )
     val preview = previewBuilder.build()
     preview.setSurfaceProvider(previewView.surfaceProvider)
 
@@ -1109,10 +1155,22 @@ private suspend fun captureLensStillFrame(
     } catch (e: Exception) {
         Log.w("WiggleApp", "Could not apply zoom before sequential lens capture", e)
     }
+    val didConverge = kotlinx.coroutines.withTimeoutOrNull(AE_CONVERGENCE_TIMEOUT_MS) {
+        converged.await()
+    } != null
+    if (!didConverge) {
+        Log.w("WiggleApp", "3A did not converge within ${AE_CONVERGENCE_TIMEOUT_MS}ms for lens ${lens.id}; capturing anyway")
+    }
     delay(settleDelayMs)
 
     return captureCameraXBitmap(imageCapture, mainExecutor)
 }
+
+// Number of consecutive preview frames that must report stable AE/AWB before a
+// calibration frame is captured, plus a hard timeout so calibration never hangs
+// on devices that do not report 3A states.
+private const val AE_STABLE_FRAME_COUNT = 3
+private const val AE_CONVERGENCE_TIMEOUT_MS = 2500L
 
 private suspend fun captureCameraXBitmap(
     imageCapture: ImageCapture,

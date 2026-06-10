@@ -270,13 +270,20 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
 
         for ((lensId, zooms) in results) {
             if (zooms.isNotEmpty()) {
-                // Average the results from the multiple passes
-                val averageZoom = zooms.average().toFloat()
+                // Use the median of the passes: unlike the mean it is robust
+                // against a single outlier pass (e.g. a frame captured before
+                // auto-exposure had fully converged).
+                val sorted = zooms.sorted()
+                val medianZoom = if (sorted.size % 2 == 1) {
+                    sorted[sorted.size / 2]
+                } else {
+                    (sorted[sorted.size / 2 - 1] + sorted[sorted.size / 2]) / 2f
+                }
                 val limits = currentState.zoomLimitsMap[lensId] ?: Pair(1.0f, 3.0f)
-                val clamped = averageZoom.coerceIn(limits.first, limits.second)
+                val clamped = medianZoom.coerceIn(limits.first, limits.second)
                 
                 newZoomMap[lensId] = clamped
-                Log.d(TAG, "Applied averaged visual ZNCC calibration for lens $lensId: $clamped (from $zooms)")
+                Log.d(TAG, "Applied median visual ZNCC calibration for lens $lensId: $clamped (from $zooms)")
                 
                 if (lensId == currentState.secondaryLens?.id) {
                     firstSecondaryZoom = clamped
