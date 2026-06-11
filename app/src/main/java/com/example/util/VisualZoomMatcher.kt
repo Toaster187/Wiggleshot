@@ -66,12 +66,15 @@ object VisualZoomMatcher {
         var bestOffsetX = 0f
         var bestOffsetY = 0f
         val zoomRange = (maxBound - minBound).coerceAtLeast(0.0001f)
-        val zoomStep = if (zoomRange > 1.2f) 0.02f else 0.01f
 
-        var zoom = minBound
-        while (zoom <= maxBound + 0.0001f) {
-            val cropW = (bmpB.width / zoom).roundToInt().coerceIn(1, bmpB.width)
-            val cropH = (bmpB.height / zoom).roundToInt().coerceIn(1, bmpB.height)
+        fun evaluate(zoomToCheck: Float, offsetStepsX: FloatArray, offsetStepsY: FloatArray): Triple<Float, Float, Float> {
+            var localBestAdj = -2f
+            var localBestRaw = -2f
+            var localBestX = 0f
+            var localBestY = 0f
+
+            val cropW = (bmpB.width / zoomToCheck).roundToInt().coerceIn(1, bmpB.width)
+            val cropH = (bmpB.height / zoomToCheck).roundToInt().coerceIn(1, bmpB.height)
             val cropX0 = (bmpB.width - cropW) / 2
             val cropY0 = (bmpB.height - cropH) / 2
             val innerW = (cropW * REF_FRACTION).roundToInt().coerceIn(1, cropW)
@@ -81,8 +84,8 @@ object VisualZoomMatcher {
             val centeredX0 = cropX0 + (cropW - innerW) / 2f
             val centeredY0 = cropY0 + (cropH - innerH) / 2f
 
-            for (offsetY in OFFSET_STEPS) {
-                for (offsetX in OFFSET_STEPS) {
+            for (offsetY in offsetStepsY) {
+                for (offsetX in offsetStepsX) {
                     val sampleX0 = (centeredX0 + offsetX * maxShiftX)
                         .roundToInt()
                         .coerceIn(cropX0, cropX0 + cropW - innerW)
@@ -103,23 +106,64 @@ object VisualZoomMatcher {
                     val gradScore = zncc(gradA, statsGradA, gradientMagnitude(lumB))
                     val rawScore = LUMA_WEIGHT * lumScore + GRADIENT_WEIGHT * gradScore
 
-                    val cropPenalty = ((zoom - minBound) / zoomRange) * ZOOM_CROP_PENALTY
+                    val cropPenalty = ((zoomToCheck - minBound) / zoomRange) * ZOOM_CROP_PENALTY
                     val offsetDistance = sqrt(
                         (offsetX * offsetX + offsetY * offsetY).toDouble()
                     ).toFloat() / sqrt(2f)
                     val adjustedScore = rawScore - cropPenalty - offsetDistance * OFFSET_PENALTY
 
-                    if (adjustedScore > bestAdjustedScore) {
-                        bestAdjustedScore = adjustedScore
-                        bestRawScore = rawScore
-                        bestZoom = zoom
-                        bestOffsetX = offsetX
-                        bestOffsetY = offsetY
+                    if (adjustedScore > localBestAdj) {
+                        localBestAdj = adjustedScore
+                        localBestRaw = rawScore
+                        localBestX = offsetX
+                        localBestY = offsetY
                     }
                 }
             }
+            return Triple(localBestAdj, localBestX, localBestY)
+        }
 
-            zoom += zoomStep
+        // Phase 1: Coarse Search
+        val coarseZoomStep = 0.1f
+        val coarseOffsetsX = floatArrayOf(-0.66f, 0f, 0.66f)
+        val coarseOffsetsY = floatArrayOf(-0.66f, 0f, 0.66f)
+        
+        class Candidate(val zoom: Float, val score: Float)
+        val coarseCandidates = mutableListOf<Candidate>()
+
+        var zCoarse = minBound
+        while (zCoarse <= maxBound + 0.0001f) {
+            val (adjScore, _, _) = evaluate(zCoarse, coarseOffsetsX, coarseOffsetsY)
+            coarseCandidates.add(Candidate(zCoarse, adjScore))
+            zCoarse += coarseZoomStep
+        }
+
+        // Phase 2: Fine Search around top candidates
+        coarseCandidates.sortByDescending { it.score }
+        val topCandidates = coarseCandidates.take(3).map { it.zoom }
+
+        val fineZoomStep = 0.01f
+        val fineOffsets = OFFSET_STEPS
+        val evaluatedZooms = mutableSetOf<Int>()
+
+        for (baseZoom in topCandidates) {
+            var zFine = (baseZoom - 0.06f).coerceAtLeast(minBound)
+            val zEnd = (baseZoom + 0.06f).coerceAtMost(maxBound)
+            
+            while (zFine <= zEnd + 0.0001f) {
+                val zoomKey = (zFine * 1000).roundToInt()
+                if (evaluatedZooms.add(zoomKey)) {
+                    val (adjScore, offX, offY) = evaluate(zFine, fineOffsets, fineOffsets)
+                    if (adjScore > bestAdjustedScore) {
+                        bestAdjustedScore = adjScore
+                        bestRawScore = adjScore
+                        bestZoom = zFine
+                        bestOffsetX = offX
+                        bestOffsetY = offY
+                    }
+                }
+                zFine += fineZoomStep
+            }
         }
 
         Log.d(

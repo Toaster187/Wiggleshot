@@ -174,7 +174,95 @@ fun SettingsScreen(
             }
         }
 
-        // 2. Primärlinse auswählen
+        Spacer(modifier = Modifier.height(10.dp))
+
+        // 2. Foto-Qualität
+        Text(
+            text = "FOTO-QUALITÄT",
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Bold,
+            color = Color(0xFF4E586E),
+            letterSpacing = 1.sp,
+            fontFamily = FontFamily.Monospace,
+            modifier = Modifier.padding(bottom = 10.dp)
+        )
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 24.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            val is4K = uiState.is4K
+            
+            // 4K Option
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(if (is4K) Color(0xFF00FFCC) else Color(0xFF161920))
+                    .border(
+                        width = 1.dp,
+                        color = if (is4K) Color(0xFF00FFCC) else Color(0xFF232A38),
+                        shape = RoundedCornerShape(16.dp)
+                    )
+                    .clickable { viewModel.setIs4K(context, true) }
+                    .padding(vertical = 16.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        text = "4K ULTRA",
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Black,
+                        fontFamily = FontFamily.Monospace,
+                        color = if (is4K) Color.Black else Color.White
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Maximale Auflösung",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = if (is4K) Color(0xFF1E2430) else Color.Gray
+                    )
+                }
+            }
+
+            // HD Option
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(if (!is4K) Color(0xFF00FFCC) else Color(0xFF161920))
+                    .border(
+                        width = 1.dp,
+                        color = if (!is4K) Color(0xFF00FFCC) else Color(0xFF232A38),
+                        shape = RoundedCornerShape(16.dp)
+                    )
+                    .clickable { viewModel.setIs4K(context, false) }
+                    .padding(vertical = 16.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        text = "HD 1080P",
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Black,
+                        fontFamily = FontFamily.Monospace,
+                        color = if (!is4K) Color.Black else Color.White
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Kompaktere Dateien",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = if (!is4K) Color(0xFF1E2430) else Color.Gray
+                    )
+                }
+            }
+        }
+
+        // 3. Primärlinse auswählen
         Text(
             text = "PRIMÄRLINSE",
             fontSize = 12.sp,
@@ -240,7 +328,7 @@ fun SettingsScreen(
 
         Spacer(modifier = Modifier.height(20.dp))
 
-        // 3. Sekundärlinsen auswählen
+        // 4. Sekundärlinsen auswählen
         val maxSelectable = (uiState.lensCount - 1).coerceAtLeast(1)
         Text(
             text = "SEKUNDÄRLINSEN (WÄHLE $maxSelectable)",
@@ -325,7 +413,7 @@ fun SettingsScreen(
 
         Spacer(modifier = Modifier.height(24.dp))
 
-        // 4. Zoom-Limits pro Linse (Akkordeon)
+        // 5. Zoom-Limits pro Linse (Akkordeon)
         Text(
             text = "INDIVIDUELLE ZOOM-LIMITS",
             fontSize = 12.sp,

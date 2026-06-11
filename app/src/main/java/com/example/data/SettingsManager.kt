@@ -9,8 +9,19 @@ object SettingsManager {
     private const val KEY_PRIMARY_LENS_ID = "primary_lens_id"
     private const val KEY_SECONDARY_LENS_IDS = "secondary_lens_ids"
     private const val KEY_ZOOM_LIMITS = "zoom_limits" // Format: lensId:min:max,lensId:min:max
+    private const val KEY_IS_4K = "is_4k"
 
     private const val TAG = "SettingsManager"
+
+    fun getIs4K(context: Context): Boolean {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return prefs.getBoolean(KEY_IS_4K, true)
+    }
+
+    fun saveIs4K(context: Context, is4K: Boolean) {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit().putBoolean(KEY_IS_4K, is4K).apply()
+    }
 
     fun getLensCount(context: Context): Int {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)

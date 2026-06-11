@@ -23,8 +23,7 @@ class DualCameraManager(
     private val physicalIdB: String?,
     private val surfaceA: Surface,
     private val surfaceB: Surface,
-    private val width: Int = 1920,
-    private val height: Int = 1080,
+    private val is4K: Boolean = true,
     private val onDualCapture: (ByteArray, ByteArray) -> Unit,
     private val onCaptureFailed: (() -> Unit)? = null
 ) {
@@ -64,8 +63,8 @@ class DualCameraManager(
             Log.e("DualCameraManager", "Failed to get zoom range", e)
         }
 
-        sizeA = getLargest43Size(physicalIdA ?: logicalCameraId)
-        sizeB = getLargest43Size(physicalIdB ?: logicalCameraId)
+        sizeA = get43Size(physicalIdA ?: logicalCameraId)
+        sizeB = get43Size(physicalIdB ?: logicalCameraId)
         
         Log.d("DualCameraManager", "Initializing ImageReaders with 4:3 sizes: sizeA=${sizeA.width}x${sizeA.height}, sizeB=${sizeB.width}x${sizeB.height}")
 
@@ -93,7 +92,7 @@ class DualCameraManager(
         }, backgroundHandler)
     }
 
-    private fun getLargest43Size(cameraId: String): Size {
+    private fun get43Size(cameraId: String): Size {
         try {
             val chars = cameraManager.getCameraCharacteristics(cameraId)
             val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
@@ -105,15 +104,23 @@ class DualCameraManager(
                     val diffInv = Math.abs(aspect - (3.0f / 4.0f))
                     diff < 0.1 || diffInv < 0.1
                 }
-                if (fourThirdsSizes.isNotEmpty()) {
-                    return fourThirdsSizes.maxByOrNull { it.width * it.height }!!
+                
+                val candidates = if (fourThirdsSizes.isNotEmpty()) fourThirdsSizes else sizes.toList()
+                
+                if (!is4K) {
+                    val hdCandidates = candidates.filter { it.width <= 1920 && it.height <= 1920 }
+                    if (hdCandidates.isNotEmpty()) {
+                        return hdCandidates.maxByOrNull { it.width * it.height }!!
+                    }
+                    return candidates.minByOrNull { it.width * it.height }!!
+                } else {
+                    return candidates.maxByOrNull { it.width * it.height }!!
                 }
-                return sizes.maxByOrNull { it.width * it.height }!!
             }
         } catch (e: Exception) {
-            Log.e("DualCameraManager", "Error finding largest 4:3 size for camera $cameraId", e)
+            Log.e("DualCameraManager", "Error finding 4:3 size for camera $cameraId", e)
         }
-        return Size(4032, 3024)
+        return if (is4K) Size(4032, 3024) else Size(1440, 1080)
     }
 
     private var captureTimeoutRunnable: Runnable? = null

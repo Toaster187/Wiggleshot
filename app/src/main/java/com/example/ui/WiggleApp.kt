@@ -329,7 +329,7 @@ fun PreviewAndControlLayout(
         }
     }
 
-    DisposableEffect(uiState.primaryLens, uiState.secondaryLens, isResumed, cameraRestartToken) {
+    DisposableEffect(uiState.primaryLens, uiState.secondaryLens, uiState.is4K, isResumed, cameraRestartToken) {
         val primary = uiState.primaryLens
         val secondary = uiState.secondaryLens
 
@@ -349,8 +349,23 @@ fun PreviewAndControlLayout(
                 val logicalChars = cameraManager.getCameraCharacteristics(logicalIdA)
                 val sensorOrient = logicalChars.get(android.hardware.camera2.CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
                 
+                val streamMap = logicalChars.get(android.hardware.camera2.CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                val previewSizes = streamMap?.getOutputSizes(android.graphics.SurfaceTexture::class.java)
+                val previewSize = previewSizes
+                    ?.filter { s -> val r = s.width.toFloat() / s.height; Math.abs(r - 4f/3f) < 0.1f }
+                    ?.filter { s -> s.width <= 1920 }  // Begrenzen für Preview-Performance
+                    ?.maxByOrNull { it.width * it.height }
+                    ?: android.util.Size(1440, 1080)
+
+                val bufW = previewSize.width
+                val bufH = previewSize.height
+
                 textureViewA.sensorOrientation = sensorOrient
                 textureViewB.sensorOrientation = sensorOrient
+                textureViewA.bufferWidth = bufW.toFloat()
+                textureViewA.bufferHeight = bufH.toFloat()
+                textureViewB.bufferWidth = bufW.toFloat()
+                textureViewB.bufferHeight = bufH.toFloat()
 
                 val initDualManager = { stA: android.graphics.SurfaceTexture, stB: android.graphics.SurfaceTexture ->
                     dualManager?.stop()
@@ -361,6 +376,7 @@ fun PreviewAndControlLayout(
                         physicalIdB = secondary.id,
                         surfaceA = android.view.Surface(stA),
                         surfaceB = android.view.Surface(stB),
+                        is4K = uiState.is4K,
                         onDualCapture = { bytesA, bytesB ->
                             try {
                                 val bitmapA = android.graphics.BitmapFactory.decodeByteArray(bytesA, 0, bytesA.size)
@@ -398,10 +414,10 @@ fun PreviewAndControlLayout(
                 // wait for surface textures to be available
                 textureViewA.surfaceTextureListener = object : android.view.TextureView.SurfaceTextureListener {
                     override fun onSurfaceTextureAvailable(st: android.graphics.SurfaceTexture, width: Int, height: Int) {
-                        st.setDefaultBufferSize(1440, 1080)
+                        st.setDefaultBufferSize(bufW, bufH)
                         textureViewB.surfaceTextureListener = object : android.view.TextureView.SurfaceTextureListener {
                             override fun onSurfaceTextureAvailable(st2: android.graphics.SurfaceTexture, width2: Int, height2: Int) {
-                                st2.setDefaultBufferSize(1440, 1080)
+                                st2.setDefaultBufferSize(bufW, bufH)
                                 initDualManager(st, st2)
                             }
                             override fun onSurfaceTextureSizeChanged(st: android.graphics.SurfaceTexture, width: Int, height: Int) {}
@@ -409,7 +425,7 @@ fun PreviewAndControlLayout(
                             override fun onSurfaceTextureUpdated(st: android.graphics.SurfaceTexture) {}
                         }
                         if (textureViewB.surfaceTexture != null) {
-                            textureViewB.surfaceTexture!!.setDefaultBufferSize(1440, 1080)
+                            textureViewB.surfaceTexture!!.setDefaultBufferSize(bufW, bufH)
                             initDualManager(st, textureViewB.surfaceTexture!!)
                         }
                     }
@@ -420,8 +436,8 @@ fun PreviewAndControlLayout(
                 
                 // If they are already available (recomposition)
                 if (textureViewA.surfaceTexture != null && textureViewB.surfaceTexture != null) {
-                    textureViewA.surfaceTexture!!.setDefaultBufferSize(1440, 1080)
-                    textureViewB.surfaceTexture!!.setDefaultBufferSize(1440, 1080)
+                    textureViewA.surfaceTexture!!.setDefaultBufferSize(bufW, bufH)
+                    textureViewB.surfaceTexture!!.setDefaultBufferSize(bufW, bufH)
                     initDualManager(textureViewA.surfaceTexture!!, textureViewB.surfaceTexture!!)
                 }
             } else {
@@ -430,16 +446,16 @@ fun PreviewAndControlLayout(
                 try {
                     val cameraProvider = ProcessCameraProvider.getInstance(context).get()
                     cameraProvider.unbindAll()
-
+                    val captureResolutionSelector = buildCaptureResolutionSelector(uiState.is4K)
                     val builderA = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-                        .setTargetAspectRatio(androidx.camera.core.AspectRatio.RATIO_4_3)
+                        .setResolutionSelector(captureResolutionSelector)
                     if (primary.parentLogicalId != null && android.os.Build.VERSION.SDK_INT >= 28) {
                         androidx.camera.camera2.interop.Camera2Interop.Extender(builderA).setPhysicalCameraId(primary.id)
                     }
                     val capA = builderA.build()
-
+ 
                     val builderB = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-                        .setTargetAspectRatio(androidx.camera.core.AspectRatio.RATIO_4_3)
+                        .setResolutionSelector(captureResolutionSelector)
                     if (secondary.parentLogicalId != null && android.os.Build.VERSION.SDK_INT >= 28) {
                         androidx.camera.camera2.interop.Camera2Interop.Extender(builderB).setPhysicalCameraId(secondary.id)
                     }
@@ -488,6 +504,8 @@ fun PreviewAndControlLayout(
             dualManager?.stop()
             dualManager = null
             cameraXPairReady = false
+            textureViewA.cleanup()
+            textureViewB.cleanup()
         }
     }
     
@@ -535,6 +553,7 @@ fun PreviewAndControlLayout(
                         previewView = previewViewA,
                         lens = lens,
                         zoom = zoom,
+                        is4K = uiState.is4K,
                         mainExecutor = mainExecutor,
                         settleDelayMs = 220L
                     )
@@ -545,6 +564,7 @@ fun PreviewAndControlLayout(
                         previewView = previewViewA,
                         lens = lens,
                         zoom = zoom,
+                        is4K = uiState.is4K,
                         mainExecutor = mainExecutor,
                         settleDelayMs = if (index == 0) 220L else 140L
                     )
@@ -870,13 +890,13 @@ fun PreviewAndControlLayout(
                                     for (lens in uiState.secondaryLenses) {
                                         if (uiState.secondaryLens?.id != lens.id) {
                                             viewModel.setSecondaryLens(lens)
-                                            delay(if (useSequentialCalibration) 150 else 2000)
+                                            delay(if (useSequentialCalibration) 150 else 800)
                                         }
                                         
                                         val limits = uiState.zoomLimitsMap[lens.id] ?: Pair(1.0f, 3.0f)
                                         val minZoom = limits.first.coerceAtLeast(1.0f)
                                         val maxZoom = limits.second
-                                        val passes = if (useSequentialCalibration) 3 else 5
+                                        val passes = 3
 
                                         if (!useSequentialCalibration) {
                                             // Reset the secondary to its baseline zoom before sampling
@@ -886,7 +906,7 @@ fun PreviewAndControlLayout(
                                             // producing different results on every run. Also give the
                                             // 3A loops (AE/AWB) time to settle before grabbing frames.
                                             viewModel.setZoomB(minZoom)
-                                            delay(900)
+                                            delay(400)
                                         }
                                         
                                         // Run visual matching multiple times and collect results
@@ -900,6 +920,7 @@ fun PreviewAndControlLayout(
                                                     previewView = previewViewA,
                                                     lens = primaryLens,
                                                     zoom = uiState.zoomMap[primaryLens.id] ?: 1f,
+                                                    is4K = uiState.is4K,
                                                     mainExecutor = mainExecutor,
                                                     settleDelayMs = 250L
                                                 )
@@ -914,6 +935,7 @@ fun PreviewAndControlLayout(
                                                     previewView = previewViewA,
                                                     lens = lens,
                                                     zoom = minZoom,
+                                                    is4K = uiState.is4K,
                                                     mainExecutor = mainExecutor,
                                                     settleDelayMs = 250L
                                                 )
@@ -928,7 +950,7 @@ fun PreviewAndControlLayout(
                                             }
                                             
                                             if (i < passes - 1) {
-                                                delay(if (useSequentialCalibration) 120 else 250)
+                                                delay(if (useSequentialCalibration) 120 else 100)
                                             }
                                         }
                                     }
@@ -1024,62 +1046,93 @@ fun updateTextureViewTransform(
     viewWidth: Float, 
     viewHeight: Float, 
     zoom: Float,
-    sensorOrientation: Int = 90
+    sensorOrientation: Int = 90,
+    bufferWidth: Float = 1440f,
+    bufferHeight: Float = 1080f
 ) {
-    val matrix = android.graphics.Matrix()
     if (viewWidth == 0f || viewHeight == 0f) return
 
+    val matrix = android.graphics.Matrix()
     val centerX = viewWidth / 2f
     val centerY = viewHeight / 2f
 
-    // We assume the camera buffer is generally a 4:3 landscape stream like 1440x1080
-    val bufferWidth = 1440f
-    val bufferHeight = 1080f
+    // 1. Keine zusätzliche Rotation der TextureView nötig, da die SurfaceTexture
+    //    den Preview-Stream bereits intern an die native Geräteausrichtung (Portrait) anpasst.
+    val rotation = 0f
+    matrix.postRotate(rotation, centerX, centerY)
 
-    // 1. Un-stretch to actual stream ratio
-    matrix.postScale(bufferWidth / viewWidth, bufferHeight / viewHeight, centerX, centerY)
-    
-    // 2. Rotate it based on sensor orientation
-    matrix.postRotate(sensorOrientation.toFloat(), centerX, centerY)
-    
-    // 3. Center crop to fill the container view without distortion
-    val rotatedWidth = if (sensorOrientation % 180 != 0) bufferHeight else bufferWidth
-    val rotatedHeight = if (sensorOrientation % 180 != 0) bufferWidth else bufferHeight
-    val scaleFill = maxOf(viewWidth / rotatedWidth, viewHeight / rotatedHeight)
-    matrix.postScale(scaleFill, scaleFill, centerX, centerY)
-    
-    // 4. Apply manual/auto zoom crop
+    // 2. Nach der internen SurfaceTexture-Rotation liegt der Buffer bereits im Hochformat vor.
+    //    Daher sind Breite und Höhe vertauscht:
+    val bufferPortraitWidth = bufferHeight
+    val bufferPortraitHeight = bufferWidth
+
+    // 3. Gleichmäßige Skalierung (Center-Crop) zur Beseitigung von Verzerrungen
+    val scaleFill = maxOf(viewWidth / bufferPortraitWidth, viewHeight / bufferPortraitHeight)
+    val scaleX = scaleFill * (bufferPortraitWidth / viewWidth)
+    val scaleY = scaleFill * (bufferPortraitHeight / viewHeight)
+    matrix.postScale(scaleX, scaleY, centerX, centerY)
+
+    // 4. Manueller/Automatischer Zoom
     matrix.postScale(zoom, zoom, centerX, centerY)
-    
+
     textureView.setTransform(matrix)
 }
 
 class ZoomableTextureView(context: Context) : android.view.TextureView(context) {
     var currentZoom: Float = 1f
     var sensorOrientation: Int = 90
-        set(value) {
-            field = value
-            if (lastWidth > 0 && lastHeight > 0) {
-                updateTextureViewTransform(this, lastWidth, lastHeight, currentZoom, field)
-            }
-        }
-    var lastWidth: Float = 0f
-    var lastHeight: Float = 0f
+        set(value) { field = value; applyTransform() }
+    var bufferWidth: Float = 1440f
+        set(value) { field = value; applyTransform() }
+    var bufferHeight: Float = 1080f
+        set(value) { field = value; applyTransform() }
+    private var lastWidth: Float = 0f
+    private var lastHeight: Float = 0f
+
+    private val layoutListener = android.view.View.OnLayoutChangeListener { _, left, top, right, bottom, _, _, _, _ ->
+        lastWidth = (right - left).toFloat()
+        lastHeight = (bottom - top).toFloat()
+        applyTransform()
+    }
 
     init {
-        addOnLayoutChangeListener { _, left, top, right, bottom, _, _, _, _ ->
-            lastWidth = (right - left).toFloat()
-            lastHeight = (bottom - top).toFloat()
-            updateTextureViewTransform(this, lastWidth, lastHeight, currentZoom, sensorOrientation)
+        addOnLayoutChangeListener(layoutListener)
+    }
+
+    private fun applyTransform() {
+        if (lastWidth > 0 && lastHeight > 0) {
+            updateTextureViewTransform(this, lastWidth, lastHeight, currentZoom, sensorOrientation, bufferWidth, bufferHeight)
         }
     }
 
     fun updateZoom(newZoom: Float) {
         currentZoom = newZoom
-        if (lastWidth > 0 && lastHeight > 0) {
-            updateTextureViewTransform(this, lastWidth, lastHeight, currentZoom, sensorOrientation)
-        }
+        applyTransform()
     }
+
+    fun cleanup() {
+        removeOnLayoutChangeListener(layoutListener)
+    }
+}
+
+private fun buildCaptureResolutionSelector(is4K: Boolean): androidx.camera.core.resolutionselector.ResolutionSelector {
+    val resolutionStrategy = if (is4K) {
+        androidx.camera.core.resolutionselector.ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY
+    } else {
+        androidx.camera.core.resolutionselector.ResolutionStrategy(
+            android.util.Size(1920, 1440),
+            androidx.camera.core.resolutionselector.ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER
+        )
+    }
+    return androidx.camera.core.resolutionselector.ResolutionSelector.Builder()
+        .setAspectRatioStrategy(
+            androidx.camera.core.resolutionselector.AspectRatioStrategy(
+                androidx.camera.core.AspectRatio.RATIO_4_3,
+                androidx.camera.core.resolutionselector.AspectRatioStrategy.FALLBACK_RULE_AUTO
+            )
+        )
+        .setResolutionStrategy(resolutionStrategy)
+        .build()
 }
 
 private suspend fun captureLensStillFrame(
@@ -1088,6 +1141,7 @@ private suspend fun captureLensStillFrame(
     previewView: PreviewView,
     lens: CameraLensDetails,
     zoom: Float,
+    is4K: Boolean,
     mainExecutor: Executor,
     settleDelayMs: Long
 ): Bitmap? {
@@ -1097,7 +1151,7 @@ private suspend fun captureLensStillFrame(
     val logicalId = lens.parentLogicalId ?: lens.id
     val imageCaptureBuilder = ImageCapture.Builder()
         .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-        .setTargetAspectRatio(androidx.camera.core.AspectRatio.RATIO_4_3)
+        .setResolutionSelector(buildCaptureResolutionSelector(is4K))
     if (lens.parentLogicalId != null && android.os.Build.VERSION.SDK_INT >= 28) {
         androidx.camera.camera2.interop.Camera2Interop.Extender(imageCaptureBuilder)
             .setPhysicalCameraId(lens.id)

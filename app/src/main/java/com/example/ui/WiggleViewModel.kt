@@ -53,7 +53,8 @@ data class WiggleUiState(
     val isAutoZoomApplied: Boolean = false,
     val isCalibrating: Boolean = false,
     val lensCount: Int = 2,
-    val showSettings: Boolean = false
+    val showSettings: Boolean = false,
+    val is4K: Boolean = true
 )
 
 class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
@@ -174,6 +175,7 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
                 val savedSecondaryIds = com.example.data.SettingsManager.getSecondaryLensIds(context)
                 val savedLensCount = com.example.data.SettingsManager.getLensCount(context)
                 val savedZoomLimits = com.example.data.SettingsManager.getZoomLimits(context)
+                val savedIs4K = com.example.data.SettingsManager.getIs4K(context)
 
                 var primary = lenses.firstOrNull { it.id == savedPrimaryId }
                 if (primary == null) {
@@ -239,6 +241,7 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
                     lensCount = savedLensCount,
                     zoomLimitsMap = zoomLimitsMap,
                     zoomMap = zoomMap,
+                    is4K = savedIs4K,
                     concurrentPreviewSupported = concurrentCapable,
                     previewStateMessage = if (concurrentCapable) "Dual Cameras Active" else "Single Viewfinder (Smart Fallback Capture)"
                 )
@@ -250,6 +253,13 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
 
     fun setCalibrating(calibrating: Boolean) {
         _uiState.value = _uiState.value.copy(isCalibrating = calibrating)
+    }
+
+    fun setIs4K(context: Context, is4K: Boolean) {
+        viewModelScope.launch {
+            com.example.data.SettingsManager.saveIs4K(context, is4K)
+            _uiState.value = _uiState.value.copy(is4K = is4K)
+        }
     }
 
     suspend fun calculateVisualZoomMatch(
