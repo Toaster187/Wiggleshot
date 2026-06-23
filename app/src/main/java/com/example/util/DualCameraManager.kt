@@ -243,9 +243,10 @@ class DualCameraManager(
     }
 
     fun takePicture() {
-        if (isClosed) return
+        if (isClosed) { onCaptureFailed?.invoke(); return }
         try {
-            val device = cameraDevice ?: return
+            val device = cameraDevice ?: run { onCaptureFailed?.invoke(); return }
+            val session = captureSession ?: run { onCaptureFailed?.invoke(); return }
             val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
             builder.addTarget(imageReaderA.surface)
             builder.addTarget(imageReaderB.surface)
@@ -278,13 +279,19 @@ class DualCameraManager(
 
     fun stop() {
         isClosed = true
+        captureTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        bytesA = null
+        bytesB = null
         try {
             captureSession?.close()
             captureSession = null
             cameraDevice?.close()
             cameraDevice = null
+            imageReaderA.close()
+            imageReaderB.close()
         } catch (e: Exception) {
             Log.e("DualCameraManager", "Error stopping camera", e)
         }
+        backgroundThread.quitSafely()
     }
 }

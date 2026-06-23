@@ -74,7 +74,7 @@ fun SettingsScreen(
             )
         }
 
-        Divider(color = Color(0xFF232A38), thickness = 1.dp)
+        HorizontalDivider(color = Color(0xFF232A38), thickness = 1.dp)
         Spacer(modifier = Modifier.height(20.dp))
 
         // 1. Linsenanzahl-Auswahl
@@ -476,7 +476,7 @@ fun SettingsScreen(
                             .padding(horizontal = 16.dp)
                             .padding(bottom = 16.dp)
                     ) {
-                        Divider(color = Color(0xFF232A38), modifier = Modifier.padding(bottom = 16.dp))
+                        HorizontalDivider(color = Color(0xFF232A38), modifier = Modifier.padding(bottom = 16.dp))
                         
                         // Min Zoom Slider
                         Row(
