@@ -57,7 +57,7 @@ class DualCameraManager(
                 val zoomRange = chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
                 if (zoomRange != null) {
                     minZoomRatio = zoomRange.lower
-                    Log.d("DualCameraManager", "Min zoom ratio supported: \$minZoomRatio")
+                    Log.d("DualCameraManager", "Min zoom ratio supported: $minZoomRatio")
                 }
             }
         } catch (e: Exception) {
@@ -132,11 +132,18 @@ class DualCameraManager(
         }
     }
 
+    private var isClosed = false
+
     @SuppressLint("MissingPermission")
     fun start() {
+        isClosed = false
         try {
             cameraManager.openCamera(logicalCameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
+                    if (isClosed) {
+                        camera.close()
+                        return
+                    }
                     cameraDevice = camera
                     
                     try {
@@ -168,6 +175,10 @@ class DualCameraManager(
                             mainExecutor,
                             object : CameraCaptureSession.StateCallback() {
                                 override fun onConfigured(session: CameraCaptureSession) {
+                                    if (isClosed) {
+                                        session.close()
+                                        return
+                                    }
                                     captureSession = session
                                     startPreview()
                                 }
@@ -181,8 +192,14 @@ class DualCameraManager(
                         Log.e("DualCameraManager", "Error setting up session", e)
                     }
                 }
-                override fun onDisconnected(camera: CameraDevice) { camera.close() }
-                override fun onError(camera: CameraDevice, error: Int) { camera.close() }
+                override fun onDisconnected(camera: CameraDevice) { 
+                    camera.close() 
+                    if (cameraDevice == camera) cameraDevice = null
+                }
+                override fun onError(camera: CameraDevice, error: Int) { 
+                    camera.close() 
+                    if (cameraDevice == camera) cameraDevice = null
+                }
             }, backgroundHandler)
         } catch (e: Exception) {
             Log.e("DualCameraManager", "Error opening camera", e)
@@ -190,15 +207,16 @@ class DualCameraManager(
     }
 
     private fun startPreview() {
+        if (isClosed) return
         try {
-            val builder = cameraDevice?.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW) ?: return
+            val device = cameraDevice ?: return
+            val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             builder.addTarget(surfaceA)
             builder.addTarget(surfaceB)
             
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, minZoomRatio)
             }
-            // Zoom is handled via TextureView scaling and Bitmap cropping instead of CONTROL_ZOOM_RATIO
             
             captureSession?.setRepeatingRequest(builder.build(), null, backgroundHandler)
         } catch (e: Exception) {
@@ -214,8 +232,10 @@ class DualCameraManager(
     }
 
     fun takePicture() {
+        if (isClosed) return
         try {
-            val builder = cameraDevice?.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE) ?: return
+            val device = cameraDevice ?: return
+            val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
             builder.addTarget(imageReaderA.surface)
             builder.addTarget(imageReaderB.surface)
             
@@ -246,11 +266,12 @@ class DualCameraManager(
     }
 
     fun stop() {
+        isClosed = true
         try {
             captureSession?.close()
+            captureSession = null
             cameraDevice?.close()
-            // Important: we leave the images readers and background thread alive until garbage collected 
-            // or we could cleanly quit the thread here if we don't plan to reuse
+            cameraDevice = null
         } catch (e: Exception) {
             Log.e("DualCameraManager", "Error stopping camera", e)
         }

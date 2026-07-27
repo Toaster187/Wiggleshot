@@ -29,8 +29,10 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
@@ -608,7 +610,7 @@ fun PreviewAndControlLayout(
         // Hidden Secondary Viewfinder (Camera B) - Must exist for SurfaceTexture to be active & available
         Box(
             modifier = Modifier
-                .size(1.dp)
+                .size(640.dp, 480.dp)
                 .alpha(0.01f)
         ) {
             AndroidView(
@@ -1004,6 +1006,7 @@ fun WigglePlayerLayout(
                 .fillMaxWidth()
                 .background(Color(0xFF161920))
                 .padding(16.dp)
+                .verticalScroll(rememberScrollState())
         ) {
             // Title descriptor
             Row(
