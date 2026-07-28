@@ -18,6 +18,9 @@ import java.io.OutputStream
 object WiggleProcessor {
     private const val TAG = "WiggleProcessor"
 
+    /** Longest edge a frame is decoded to for playback and GIF export. */
+    const val MAX_PLAYBACK_DIMENSION = 1920
+
 
 
     /**
@@ -82,15 +85,38 @@ object WiggleProcessor {
     }
 
     /**
-     * Load image from file path safely.
+     * Loads an image for playback, downsampled so its longest edge stays within
+     * [maxDimension].
+     *
+     * A wiggle can hold four 4K frames; decoding those at full size needs well over 100 MB
+     * of heap and was a reliable way to get the app killed. The full resolution originals
+     * are untouched in the gallery.
      */
-    fun loadBitmap(path: String): Bitmap? {
+    fun loadBitmap(path: String, maxDimension: Int = MAX_PLAYBACK_DIMENSION): Bitmap? {
         return try {
-            BitmapFactory.decodeFile(path)
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(path, bounds)
+
+            val options = BitmapFactory.Options().apply {
+                inSampleSize = sampleSizeFor(bounds.outWidth, bounds.outHeight, maxDimension)
+            }
+            BitmapFactory.decodeFile(path, options)
         } catch (e: Exception) {
             Log.e(TAG, "Error decoding file: $path", e)
             null
+        } catch (e: OutOfMemoryError) {
+            Log.e(TAG, "Out of memory decoding file: $path", e)
+            null
         }
+    }
+
+    private fun sampleSizeFor(width: Int, height: Int, maxDimension: Int): Int {
+        if (width <= 0 || height <= 0 || maxDimension <= 0) return 1
+        var sampleSize = 1
+        while (maxOf(width, height) / sampleSize > maxDimension) {
+            sampleSize *= 2
+        }
+        return sampleSize
     }
 
     /**
