@@ -205,8 +205,8 @@ class DualCameraManager(
                         cameraDevice = null
                     }
                 }
-                override fun onError(camera: CameraDevice, error: Int) { 
-                    camera.close() 
+                override fun onError(camera: CameraDevice, error: Int) {
+                    camera.close()
                     if (cameraDevice == camera) {
                         cameraDevice = null
                     }
