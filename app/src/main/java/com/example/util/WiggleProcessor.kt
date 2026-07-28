@@ -92,4 +92,42 @@ object WiggleProcessor {
             null
         }
     }
+
+    /**
+     * Save an animated GIF to the device's public photo gallery.
+     */
+    fun saveGifToGallery(context: Context, gifBytes: ByteArray, publicName: String): String? {
+        val resolver = context.contentResolver
+        val imageCollection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        } else {
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        }
+
+        val contentValues = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, "$publicName.gif")
+            put(MediaStore.Images.Media.MIME_TYPE, "image/gif")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/WiggleCamera")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+        }
+
+        return try {
+            val uri = resolver.insert(imageCollection, contentValues) ?: return null
+            resolver.openOutputStream(uri).use { out ->
+                out?.write(gifBytes)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                contentValues.clear()
+                contentValues.put(MediaStore.Images.Media.IS_PENDING, 0)
+                resolver.update(uri, contentValues, null, null)
+            }
+            Log.d(TAG, "Successfully exported GIF to public gallery URI: $uri")
+            uri.toString()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error saving GIF to MediaStore", e)
+            null
+        }
+    }
 }

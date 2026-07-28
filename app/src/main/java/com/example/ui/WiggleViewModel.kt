@@ -13,6 +13,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.example.data.WiggleCapture
 import com.example.data.WiggleRepository
+import com.example.util.VisualZoomMatcher
 import com.example.util.WiggleProcessor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -40,13 +41,20 @@ data class WiggleUiState(
     val availableLenses: List<CameraLensDetails> = emptyList(),
     val primaryLens: CameraLensDetails? = null,
     val secondaryLens: CameraLensDetails? = null,
+    val secondaryLenses: List<CameraLensDetails> = emptyList(),
     val zoomA: Float = 1.0f,
     val zoomB: Float = 1.0f,
+    val zoomMap: Map<String, Float> = emptyMap(),
+    val zoomLimitsMap: Map<String, Pair<Float, Float>> = emptyMap(),
     val concurrentPreviewSupported: Boolean = false,
     val previewStateMessage: String = "",
     val captureTrigger: Int = 0,
     val autoZoomRatio: Float = 1.0f,
-    val isAutoZoomApplied: Boolean = false
+    val isAutoZoomApplied: Boolean = false,
+    val isCalibrating: Boolean = false,
+    val lensCount: Int = 2,
+    val showSettings: Boolean = false,
+    val is4K: Boolean = true
 )
 
 class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
@@ -162,190 +170,281 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
                     lenses.add(CameraLensDetails("1", "Cam 1 - Ultra-Wide (0.5x)", 1.85f, true, null))
                 }
 
-                // Default Primary: first non-ultrawide. Default Secondary: first ultrawide or second item.
-                val primary = lenses.firstOrNull { !it.isDefaultUltraWide && it.parentLogicalId != null }
-                    ?: lenses.firstOrNull { !it.isDefaultUltraWide }
-                    ?: lenses.firstOrNull()
-                val secondary = lenses.firstOrNull { it.isDefaultUltraWide && it.parentLogicalId != null }
-                    ?: lenses.firstOrNull { it.isDefaultUltraWide }
-                    ?: lenses.getOrNull(1)
-                    ?: lenses.firstOrNull()
+                // Load saved settings
+                val savedPrimaryId = com.example.data.SettingsManager.getPrimaryLensId(context)
+                val savedSecondaryIds = com.example.data.SettingsManager.getSecondaryLensIds(context)
+                val savedLensCount = com.example.data.SettingsManager.getLensCount(context)
+                val savedZoomLimits = com.example.data.SettingsManager.getZoomLimits(context)
+                val savedIs4K = com.example.data.SettingsManager.getIs4K(context)
+
+                var primary = lenses.firstOrNull { it.id == savedPrimaryId }
+                if (primary == null) {
+                    primary = lenses.firstOrNull { !it.isDefaultUltraWide && it.parentLogicalId != null }
+                        ?: lenses.firstOrNull { !it.isDefaultUltraWide }
+                        ?: lenses.firstOrNull()
+                }
+
+                // Load secondary lenses based on saved settings or default
+                val secondaryLenses = mutableListOf<CameraLensDetails>()
+                if (savedSecondaryIds.isNotEmpty()) {
+                    savedSecondaryIds.forEach { id ->
+                        lenses.firstOrNull { it.id == id }?.let { secondaryLenses.add(it) }
+                    }
+                }
+                
+                // If secondary selection is empty, pick default
+                if (secondaryLenses.isEmpty()) {
+                    val defaultSec = lenses.firstOrNull { it.id != primary?.id && it.isDefaultUltraWide && it.parentLogicalId != null }
+                        ?: lenses.firstOrNull { it.id != primary?.id && it.isDefaultUltraWide }
+                        ?: lenses.firstOrNull { it.id != primary?.id }
+                        ?: lenses.firstOrNull()
+                    if (defaultSec != null) {
+                        secondaryLenses.add(defaultSec)
+                    }
+                }
+
+                // Adjust secondary list to fit the requested lensCount - 1
+                val neededSecondaries = (savedLensCount - 1).coerceIn(1, 3)
+                while (secondaryLenses.size < neededSecondaries) {
+                    val candidate = lenses.firstOrNull { it.id != primary?.id && !secondaryLenses.any { s -> s.id == it.id } }
+                    if (candidate != null) {
+                        secondaryLenses.add(candidate)
+                    } else {
+                        break
+                    }
+                }
+                while (secondaryLenses.size > neededSecondaries) {
+                    secondaryLenses.removeAt(secondaryLenses.size - 1)
+                }
+
+                val secondary = secondaryLenses.firstOrNull()
+
+                // Default zoom limits per lens if not configured
+                val zoomLimitsMap = savedZoomLimits.toMutableMap()
+                lenses.forEach { lens ->
+                    if (!zoomLimitsMap.containsKey(lens.id)) {
+                        zoomLimitsMap[lens.id] = Pair(1.0f, 3.0f)
+                    }
+                }
+
+                // Initialize zoom values
+                val zoomMap = mutableMapOf<String, Float>()
+                lenses.forEach { lens ->
+                    zoomMap[lens.id] = 1.0f
+                }
 
                 _uiState.value = _uiState.value.copy(
                     availableLenses = lenses,
                     primaryLens = primary,
                     secondaryLens = secondary,
+                    secondaryLenses = secondaryLenses,
+                    lensCount = savedLensCount,
+                    zoomLimitsMap = zoomLimitsMap,
+                    zoomMap = zoomMap,
+                    is4K = savedIs4K,
                     concurrentPreviewSupported = concurrentCapable,
                     previewStateMessage = if (concurrentCapable) "Dual Cameras Active" else "Single Viewfinder (Smart Fallback Capture)"
                 )
-                autoCalibrateFOV()
             } catch (e: Exception) {
                 Log.e(TAG, "Failed discovering cameras", e)
             }
         }
     }
 
-    fun autoCalibrateFOV(bitmapA: Bitmap? = null, bitmapB: Bitmap? = null) {
-        if (bitmapA != null && bitmapB != null) {
-            viewModelScope.launch {
-                val bestZoom = withContext(Dispatchers.Default) {
-                    calculateVisualZoomMatch(bitmapA, bitmapB)
-                }
-                _uiState.value = _uiState.value.copy(
-                    zoomB = bestZoom,
-                    autoZoomRatio = bestZoom,
-                    isAutoZoomApplied = true
-                )
-                Log.d(TAG, "Auto FOV visually calibrated: zoomB=$bestZoom")
-            }
-            return
-        }
-        
-        // Fallback: focal length ratio
-        val primary = _uiState.value.primaryLens
-        val secondary = _uiState.value.secondaryLens
-        var ratio = 2.0f
-        if (primary?.focalLength != null && secondary?.focalLength != null && secondary.focalLength > 0f) {
-            ratio = primary.focalLength / secondary.focalLength
-        }
-        val clamped = ratio.coerceIn(1.0f, 3.0f)
-        _uiState.value = _uiState.value.copy(zoomB = clamped, autoZoomRatio = clamped, isAutoZoomApplied = true)
-        Log.d(TAG, "Auto FOV calibrated (focal length fallback): zoomB=$clamped")
+    fun setCalibrating(calibrating: Boolean) {
+        _uiState.value = _uiState.value.copy(isCalibrating = calibrating)
     }
 
-    /**
-     * Compares the center of camera A's preview with increasingly zoomed crops
-     * of camera B's preview to find the zoom level where B best matches A.
-     * 
-     * Uses Zero-mean Normalized Cross-Correlation (ZNCC) on luminance values,
-     * which is invariant to brightness/exposure differences between the two cameras.
-     * Searches from 1.00x to 3.00x in 0.01x steps.
-     */
-    private fun calculateVisualZoomMatch(bmpA: Bitmap, bmpB: Bitmap): Float {
-        val wA = bmpA.width
-        val hA = bmpA.height
-        val wB = bmpB.width
-        val hB = bmpB.height
-        
-        Log.d(TAG, "Visual match: A=${wA}x${hA}, B=${wB}x${hB}")
-        
-        // Read all pixels from both images upfront (fast bulk read)
-        val allPixelsA = IntArray(wA * hA)
-        bmpA.getPixels(allPixelsA, 0, wA, 0, 0, wA, hA)
-        val allPixelsB = IntArray(wB * hB)
-        bmpB.getPixels(allPixelsB, 0, wB, 0, 0, wB, hB)
-        
-        // Comparison grid: 64x64 = 4096 sample points per zoom level
-        val gridSize = 64
-        
-        // Reference region: center 50% of image A
-        val refSize = minOf(wA, hA) / 2
-        val refX0 = (wA - refSize) / 2
-        val refY0 = (hA - refSize) / 2
-        
-        // Sample A's center into luminance array
-        val lumA = FloatArray(gridSize * gridSize)
-        var sumA = 0.0
-        for (gy in 0 until gridSize) {
-            for (gx in 0 until gridSize) {
-                val ax = refX0 + (gx * refSize) / gridSize
-                val ay = refY0 + (gy * refSize) / gridSize
-                val c = allPixelsA[ay * wA + ax]
-                val l = ((c shr 16) and 0xFF) * 0.299f + ((c shr 8) and 0xFF) * 0.587f + (c and 0xFF) * 0.114f
-                lumA[gy * gridSize + gx] = l
-                sumA += l
-            }
+    fun setIs4K(context: Context, is4K: Boolean) {
+        viewModelScope.launch {
+            com.example.data.SettingsManager.saveIs4K(context, is4K)
+            _uiState.value = _uiState.value.copy(is4K = is4K)
         }
-        val meanA = (sumA / lumA.size).toFloat()
+    }
+
+    suspend fun calculateVisualZoomMatch(
+        bmpA: Bitmap,
+        bmpB: Bitmap,
+        minZoom: Float,
+        maxZoom: Float
+    ): Float = withContext(Dispatchers.Default) {
+        Log.d(TAG, "Visual zoom match: A=${bmpA.width}x${bmpA.height}, B=${bmpB.width}x${bmpB.height}, range=[$minZoom, $maxZoom]")
+        VisualZoomMatcher.calculate(bmpA, bmpB, minZoom, maxZoom)
+    }
+
+    fun applyCalibrationResults(results: Map<String, List<Float>>) {
+        val currentState = _uiState.value
+        val newZoomMap = currentState.zoomMap.toMutableMap()
         
-        // Precompute A's variance
-        var varSumA = 0.0
-        for (l in lumA) {
-            val d = (l - meanA).toDouble()
-            varSumA += d * d
-        }
-        
-        var bestZoom = 2.0f
-        var maxScore = -2.0f
-        
-        // Search zoom 1.00 to 3.00 in steps of 0.01 (200 iterations)
-        for (zi in 100..300) {
-            val zoom = zi / 100.0f
-            
-            // At this zoom level, the visible crop of B is:
-            val cropW = (wB / zoom).toInt()
-            val cropH = (hB / zoom).toInt()
-            if (cropW < 20 || cropH < 20) continue
-            
-            val cx0 = (wB - cropW) / 2
-            val cy0 = (hB - cropH) / 2
-            
-            // Take center 50% of B's crop (matching A's center 50% strategy)
-            val innerSize = minOf(cropW, cropH) / 2
-            if (innerSize < 10) continue
-            val ix0 = cx0 + (cropW - innerSize) / 2
-            val iy0 = cy0 + (cropH - innerSize) / 2
-            
-            // Sample B's region into luminance array
-            val lumB = FloatArray(gridSize * gridSize)
-            var sumB = 0.0
-            for (gy in 0 until gridSize) {
-                for (gx in 0 until gridSize) {
-                    val bx = ix0 + (gx * innerSize) / gridSize
-                    val by = iy0 + (gy * innerSize) / gridSize
-                    if (bx in 0 until wB && by in 0 until hB) {
-                        val c = allPixelsB[by * wB + bx]
-                        val l = ((c shr 16) and 0xFF) * 0.299f + ((c shr 8) and 0xFF) * 0.587f + (c and 0xFF) * 0.114f
-                        lumB[gy * gridSize + gx] = l
-                        sumB += l
-                    }
+        var firstSecondaryZoom = currentState.zoomB
+
+        for ((lensId, zooms) in results) {
+            if (zooms.isNotEmpty()) {
+                // Use the median of the passes: unlike the mean it is robust
+                // against a single outlier pass (e.g. a frame captured before
+                // auto-exposure had fully converged).
+                val sorted = zooms.sorted()
+                val medianZoom = if (sorted.size % 2 == 1) {
+                    sorted[sorted.size / 2]
+                } else {
+                    (sorted[sorted.size / 2 - 1] + sorted[sorted.size / 2]) / 2f
+                }
+                val limits = currentState.zoomLimitsMap[lensId] ?: Pair(1.0f, 3.0f)
+                val clamped = medianZoom.coerceIn(limits.first, limits.second)
+                
+                newZoomMap[lensId] = clamped
+                Log.d(TAG, "Applied median visual ZNCC calibration for lens $lensId: $clamped (from $zooms)")
+                
+                if (lensId == currentState.secondaryLens?.id) {
+                    firstSecondaryZoom = clamped
                 }
             }
-            val meanB = (sumB / lumB.size).toFloat()
-            
-            // Compute ZNCC (zero-mean normalized cross-correlation)
-            var crossSum = 0.0
-            var varSumB = 0.0
-            for (i in lumA.indices) {
-                val dA = (lumA[i] - meanA).toDouble()
-                val dB = (lumB[i] - meanB).toDouble()
-                crossSum += dA * dB
-                varSumB += dB * dB
-            }
-            
-            val den = Math.sqrt(varSumA * varSumB)
-            val score = if (den > 0) (crossSum / den).toFloat() else 0f
-            
-            if (score > maxScore) {
-                maxScore = score
-                bestZoom = zoom
+        }
+
+        _uiState.value = currentState.copy(
+            zoomMap = newZoomMap,
+            zoomB = firstSecondaryZoom,
+            isAutoZoomApplied = true,
+            isCalibrating = false
+        )
+    }
+
+    fun toggleSettings() {
+        _uiState.value = _uiState.value.copy(showSettings = !_uiState.value.showSettings)
+    }
+
+    fun setLensCount(context: Context, count: Int) {
+        val primary = _uiState.value.primaryLens
+        val lenses = _uiState.value.availableLenses
+        
+        val secondaryLenses = _uiState.value.secondaryLenses.toMutableList()
+        val neededSecondaries = (count - 1).coerceIn(1, 3)
+        
+        while (secondaryLenses.size < neededSecondaries) {
+            val candidate = lenses.firstOrNull { it.id != primary?.id && !secondaryLenses.any { s -> s.id == it.id } }
+            if (candidate != null) {
+                secondaryLenses.add(candidate)
+            } else {
+                break
             }
         }
+        while (secondaryLenses.size > neededSecondaries) {
+            secondaryLenses.removeAt(secondaryLenses.size - 1)
+        }
+
+        _uiState.value = _uiState.value.copy(
+            lensCount = count,
+            secondaryLenses = secondaryLenses,
+            secondaryLens = secondaryLenses.firstOrNull()
+        )
         
-        Log.d(TAG, "Visual zoom match: bestZoom=$bestZoom, score=$maxScore")
-        return bestZoom
+        com.example.data.SettingsManager.saveLensCount(context, count)
+        com.example.data.SettingsManager.saveSecondaryLensIds(context, secondaryLenses.map { it.id })
+    }
+
+    fun updatePrimaryLens(context: Context, lens: CameraLensDetails) {
+        val secondaryLenses = _uiState.value.secondaryLenses.toMutableList()
+        secondaryLenses.removeAll { it.id == lens.id }
+        
+        val lenses = _uiState.value.availableLenses
+        val neededSecondaries = (_uiState.value.lensCount - 1).coerceIn(1, 3)
+        
+        while (secondaryLenses.size < neededSecondaries) {
+            val candidate = lenses.firstOrNull { it.id != lens.id && !secondaryLenses.any { s -> s.id == it.id } }
+            if (candidate != null) {
+                secondaryLenses.add(candidate)
+            } else {
+                break
+            }
+        }
+
+        _uiState.value = _uiState.value.copy(
+            primaryLens = lens,
+            secondaryLenses = secondaryLenses,
+            secondaryLens = secondaryLenses.firstOrNull()
+        )
+        
+        com.example.data.SettingsManager.savePrimaryLensId(context, lens.id)
+        com.example.data.SettingsManager.saveSecondaryLensIds(context, secondaryLenses.map { it.id })
+
+        if (_uiState.value.isAutoZoomApplied) {
+            _uiState.value = _uiState.value.copy(isAutoZoomApplied = false)
+        }
+    }
+
+    fun updateSecondaryLenses(context: Context, newSecondaries: List<CameraLensDetails>) {
+        _uiState.value = _uiState.value.copy(
+            secondaryLenses = newSecondaries,
+            secondaryLens = newSecondaries.firstOrNull()
+        )
+        com.example.data.SettingsManager.saveSecondaryLensIds(context, newSecondaries.map { it.id })
+        if (_uiState.value.isAutoZoomApplied) {
+            _uiState.value = _uiState.value.copy(isAutoZoomApplied = false)
+        }
+    }
+
+    fun setZoomForLens(lensId: String, zoom: Float) {
+        val newZoomMap = _uiState.value.zoomMap.toMutableMap()
+        newZoomMap[lensId] = zoom
+        
+        val isPrimary = _uiState.value.primaryLens?.id == lensId
+        val firstSecondaryId = _uiState.value.secondaryLens?.id
+        
+        _uiState.value = _uiState.value.copy(
+            zoomMap = newZoomMap,
+            zoomA = if (isPrimary) zoom else _uiState.value.zoomA,
+            zoomB = if (lensId == firstSecondaryId) zoom else _uiState.value.zoomB,
+            isAutoZoomApplied = false
+        )
+    }
+
+    fun setZoomLimitsForLens(context: Context, lensId: String, min: Float, max: Float) {
+        val newLimits = _uiState.value.zoomLimitsMap.toMutableMap()
+        newLimits[lensId] = Pair(min, max)
+        
+        val newZoomMap = _uiState.value.zoomMap.toMutableMap()
+        val currentZoom = newZoomMap[lensId] ?: 1.0f
+        if (currentZoom < min) {
+            newZoomMap[lensId] = min
+        } else if (currentZoom > max) {
+            newZoomMap[lensId] = max
+        }
+
+        _uiState.value = _uiState.value.copy(
+            zoomLimitsMap = newLimits,
+            zoomMap = newZoomMap,
+            zoomA = if (_uiState.value.primaryLens?.id == lensId) (newZoomMap[lensId] ?: 1.0f) else _uiState.value.zoomA,
+            zoomB = if (_uiState.value.secondaryLens?.id == lensId) (newZoomMap[lensId] ?: 1.0f) else _uiState.value.zoomB
+        )
+        com.example.data.SettingsManager.saveZoomLimits(context, newLimits)
     }
 
     fun setPrimaryLens(lens: CameraLensDetails) {
-        _uiState.value = _uiState.value.copy(primaryLens = lens)
-        if (_uiState.value.isAutoZoomApplied) {
-            autoCalibrateFOV()
-        }
+        _uiState.value = _uiState.value.copy(primaryLens = lens, isAutoZoomApplied = false)
     }
 
     fun setSecondaryLens(lens: CameraLensDetails) {
-        _uiState.value = _uiState.value.copy(secondaryLens = lens)
-        if (_uiState.value.isAutoZoomApplied) {
-            autoCalibrateFOV()
-        }
+        _uiState.value = _uiState.value.copy(secondaryLens = lens, isAutoZoomApplied = false)
     }
 
     fun setZoomA(zoom: Float) {
         _uiState.value = _uiState.value.copy(zoomA = zoom, isAutoZoomApplied = false)
+        val pId = _uiState.value.primaryLens?.id
+        if (pId != null) {
+            val newZoomMap = _uiState.value.zoomMap.toMutableMap()
+            newZoomMap[pId] = zoom
+            _uiState.value = _uiState.value.copy(zoomMap = newZoomMap)
+        }
     }
 
     fun setZoomB(zoom: Float) {
         _uiState.value = _uiState.value.copy(zoomB = zoom, isAutoZoomApplied = false)
+        val sId = _uiState.value.secondaryLens?.id
+        if (sId != null) {
+            val newZoomMap = _uiState.value.zoomMap.toMutableMap()
+            newZoomMap[sId] = zoom
+            _uiState.value = _uiState.value.copy(zoomMap = newZoomMap)
+        }
     }
 
     fun triggerCapture() {
@@ -359,9 +458,9 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
     fun deleteCapture(context: Context, capture: WiggleCapture) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                // Delete internal files safely
-                File(capture.imageAPath).delete()
-                File(capture.imageBPath).delete()
+                capture.getImagePathList().forEach { path ->
+                    java.io.File(path).delete()
+                }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed deleting internal raw cache files", e)
             }
@@ -372,15 +471,12 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
         }
     }
 
-    /**
-     * Executes the Dual Capture capture process.
-     */
-    fun performDualCapture(context: Context, bitmapA: Bitmap?, bitmapB: Bitmap?) {
+    fun performMultiCapture(context: Context, bitmaps: List<Bitmap>) {
         viewModelScope.launch(Dispatchers.Default) {
             _uiState.value = _uiState.value.copy(isCapturing = true)
             try {
-                if (bitmapA == null || bitmapB == null) {
-                    Log.e(TAG, "Null bitmaps supplied. Cannot perform capture.")
+                if (bitmaps.isEmpty()) {
+                    Log.e(TAG, "Empty bitmaps list supplied. Cannot perform capture.")
                     withContext(Dispatchers.Main) {
                         _uiState.value = _uiState.value.copy(isCapturing = false)
                     }
@@ -388,21 +484,21 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
                 }
 
                 val timestamp = System.currentTimeMillis()
+                val savedPaths = mutableListOf<String>()
 
-                // Save to local cached directory for rapid app rendering in LazyColumns / players
-                val pathA = WiggleProcessor.saveToInternalFiles(context, bitmapA, "camA_$timestamp.jpg") ?: ""
-                val pathB = WiggleProcessor.saveToInternalFiles(context, bitmapB, "camB_$timestamp.jpg") ?: ""
+                bitmaps.forEachIndexed { index, bitmap ->
+                    val fileName = "cam_${index}_$timestamp.jpg"
+                    val path = WiggleProcessor.saveToInternalFiles(context, bitmap, fileName) ?: ""
+                    if (path.isNotEmpty()) {
+                        savedPaths.add(path)
+                    }
+                    WiggleProcessor.saveToGallery(context, bitmap, "Wiggle_${timestamp}_Frame_$index")
+                }
 
-                // Save BOTH images at the very same time to the user's Gallery
-                val publicUriA = WiggleProcessor.saveToGallery(context, bitmapA, "Wiggle_${timestamp}_Left")
-                val publicUriB = WiggleProcessor.saveToGallery(context, bitmapB, "Wiggle_${timestamp}_Right")
+                val imagePathsString = savedPaths.joinToString(",")
 
-                Log.d(TAG, "Exported both raw shots to media store: A: $publicUriA, B: $publicUriB")
-
-                // Insert database record
                 val newCapture = WiggleCapture(
-                    imageAPath = pathA,
-                    imageBPath = pathB,
+                    imagePaths = imagePathsString,
                     timestamp = timestamp
                 )
 
@@ -416,12 +512,19 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
                     )
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Error performing stereoscopic dual frame capture", e)
+                Log.e(TAG, "Error performing multi stereoscopic frame capture", e)
                 withContext(Dispatchers.Main) {
                     _uiState.value = _uiState.value.copy(isCapturing = false)
                 }
             }
         }
+    }
+
+    fun performDualCapture(context: Context, bitmapA: Bitmap?, bitmapB: Bitmap?) {
+        val list = mutableListOf<Bitmap>()
+        if (bitmapA != null) list.add(bitmapA)
+        if (bitmapB != null) list.add(bitmapB)
+        performMultiCapture(context, list)
     }
 }
 

@@ -48,7 +48,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import java.util.concurrent.atomic.AtomicInteger
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -69,6 +71,7 @@ import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.Executor
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -123,34 +126,26 @@ fun WiggleApp(viewModel: WiggleViewModel) {
                     )
                 }
 
-                Surface(
-                    shape = RoundedCornerShape(12.dp),
-                    color = Color(0xFF1E2430),
-                    modifier = Modifier.clickable {
-                        Toast.makeText(context, "Dual Camera Calibration Locked", Toast.LENGTH_SHORT).show()
-                    }
+                IconButton(
+                    onClick = { viewModel.toggleSettings() },
+                    modifier = Modifier
+                        .background(Color(0xFF1E2430), RoundedCornerShape(12.dp))
+                        .size(44.dp)
                 ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(8.dp)
-                                .background(Color(0xFF00FFCC), CircleShape)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = "STEREO ACTIVE",
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = Color.White
-                        )
-                    }
+                    Icon(
+                        imageVector = Icons.Default.Settings,
+                        contentDescription = "Einstellungen",
+                        tint = Color.White
+                    )
                 }
             }
 
-            if (cameraPermissionState.status.isGranted) {
+            if (uiState.showSettings) {
+                SettingsScreen(
+                    viewModel = viewModel,
+                    onBack = { viewModel.toggleSettings() }
+                )
+            } else if (cameraPermissionState.status.isGranted) {
                 Box(
                     modifier = Modifier
                         .weight(1f)
@@ -300,8 +295,12 @@ fun PreviewAndControlLayout(
     
     var activeCaptureA by remember { mutableStateOf<ImageCapture?>(null) }
     var activeCaptureB by remember { mutableStateOf<ImageCapture?>(null) }
+    var captureTimeoutJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
     
     var isCapturing by remember { mutableStateOf(false) }
+    var cameraXPairReady by remember { mutableStateOf(false) }
+    var cameraRestartToken by remember { mutableStateOf(0) }
+    var stillCountdown by remember { mutableStateOf<Int?>(null) }
     val mainExecutor = androidx.core.content.ContextCompat.getMainExecutor(context)
 
     // For DualCameraManager on API >= 28
@@ -333,11 +332,16 @@ fun PreviewAndControlLayout(
         }
     }
 
-    DisposableEffect(uiState.primaryLens, uiState.secondaryLens, isResumed) {
+    DisposableEffect(uiState.primaryLens, uiState.secondaryLens, uiState.is4K, isResumed, cameraRestartToken) {
         val primary = uiState.primaryLens
         val secondary = uiState.secondaryLens
 
         if (isResumed && primary != null && secondary != null) {
+            cameraXPairReady = false
+            activeCaptureA = null
+            activeCaptureB = null
+            cameraControlA = null
+            cameraControlB = null
             val logicalIdA = primary.parentLogicalId ?: primary.id
             val logicalIdB = secondary.parentLogicalId ?: secondary.id
 
@@ -348,8 +352,23 @@ fun PreviewAndControlLayout(
                 val logicalChars = cameraManager.getCameraCharacteristics(logicalIdA)
                 val sensorOrient = logicalChars.get(android.hardware.camera2.CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
                 
+                val streamMap = logicalChars.get(android.hardware.camera2.CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                val previewSizes = streamMap?.getOutputSizes(android.graphics.SurfaceTexture::class.java)
+                val previewSize = previewSizes
+                    ?.filter { s -> val r = s.width.toFloat() / s.height; Math.abs(r - 4f/3f) < 0.1f }
+                    ?.filter { s -> s.width <= 1920 }  // Begrenzen für Preview-Performance
+                    ?.maxByOrNull { it.width * it.height }
+                    ?: android.util.Size(1440, 1080)
+
+                val bufW = previewSize.width
+                val bufH = previewSize.height
+
                 textureViewA.sensorOrientation = sensorOrient
                 textureViewB.sensorOrientation = sensorOrient
+                textureViewA.bufferWidth = bufW.toFloat()
+                textureViewA.bufferHeight = bufH.toFloat()
+                textureViewB.bufferWidth = bufW.toFloat()
+                textureViewB.bufferHeight = bufH.toFloat()
 
                 val initDualManager = { stA: android.graphics.SurfaceTexture, stB: android.graphics.SurfaceTexture ->
                     dualManager?.stop()
@@ -360,6 +379,7 @@ fun PreviewAndControlLayout(
                         physicalIdB = secondary.id,
                         surfaceA = android.view.Surface(stA),
                         surfaceB = android.view.Surface(stB),
+                        is4K = uiState.is4K,
                         onDualCapture = { bytesA, bytesB ->
                             try {
                                 val bitmapA = android.graphics.BitmapFactory.decodeByteArray(bytesA, 0, bytesA.size)
@@ -397,10 +417,10 @@ fun PreviewAndControlLayout(
                 // wait for surface textures to be available
                 textureViewA.surfaceTextureListener = object : android.view.TextureView.SurfaceTextureListener {
                     override fun onSurfaceTextureAvailable(st: android.graphics.SurfaceTexture, width: Int, height: Int) {
-                        st.setDefaultBufferSize(1440, 1080)
+                        st.setDefaultBufferSize(bufW, bufH)
                         textureViewB.surfaceTextureListener = object : android.view.TextureView.SurfaceTextureListener {
                             override fun onSurfaceTextureAvailable(st2: android.graphics.SurfaceTexture, width2: Int, height2: Int) {
-                                st2.setDefaultBufferSize(1440, 1080)
+                                st2.setDefaultBufferSize(bufW, bufH)
                                 initDualManager(st, st2)
                             }
                             override fun onSurfaceTextureSizeChanged(st: android.graphics.SurfaceTexture, width: Int, height: Int) {}
@@ -408,7 +428,7 @@ fun PreviewAndControlLayout(
                             override fun onSurfaceTextureUpdated(st: android.graphics.SurfaceTexture) {}
                         }
                         if (textureViewB.surfaceTexture != null) {
-                            textureViewB.surfaceTexture!!.setDefaultBufferSize(1440, 1080)
+                            textureViewB.surfaceTexture!!.setDefaultBufferSize(bufW, bufH)
                             initDualManager(st, textureViewB.surfaceTexture!!)
                         }
                     }
@@ -419,8 +439,8 @@ fun PreviewAndControlLayout(
                 
                 // If they are already available (recomposition)
                 if (textureViewA.surfaceTexture != null && textureViewB.surfaceTexture != null) {
-                    textureViewA.surfaceTexture!!.setDefaultBufferSize(1440, 1080)
-                    textureViewB.surfaceTexture!!.setDefaultBufferSize(1440, 1080)
+                    textureViewA.surfaceTexture!!.setDefaultBufferSize(bufW, bufH)
+                    textureViewB.surfaceTexture!!.setDefaultBufferSize(bufW, bufH)
                     initDualManager(textureViewA.surfaceTexture!!, textureViewB.surfaceTexture!!)
                 }
             } else {
@@ -429,26 +449,31 @@ fun PreviewAndControlLayout(
                 try {
                     val cameraProvider = ProcessCameraProvider.getInstance(context).get()
                     cameraProvider.unbindAll()
-
+                    val captureResolutionSelector = buildCaptureResolutionSelector(uiState.is4K)
                     val builderA = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-                        .setTargetAspectRatio(androidx.camera.core.AspectRatio.RATIO_4_3)
+                        .setResolutionSelector(captureResolutionSelector)
                     if (primary.parentLogicalId != null && android.os.Build.VERSION.SDK_INT >= 28) {
                         androidx.camera.camera2.interop.Camera2Interop.Extender(builderA).setPhysicalCameraId(primary.id)
                     }
                     val capA = builderA.build()
-
+ 
                     val builderB = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-                        .setTargetAspectRatio(androidx.camera.core.AspectRatio.RATIO_4_3)
+                        .setResolutionSelector(captureResolutionSelector)
                     if (secondary.parentLogicalId != null && android.os.Build.VERSION.SDK_INT >= 28) {
                         androidx.camera.camera2.interop.Camera2Interop.Extender(builderB).setPhysicalCameraId(secondary.id)
                     }
                     val capB = builderB.build()
 
-                    activeCaptureA = capA
-                    activeCaptureB = capB
-
                     val cameraSelectorA = findCameraSelector(cameraProvider, logicalIdA)
-                    val previewBuilderA = Preview.Builder().setTargetAspectRatio(androidx.camera.core.AspectRatio.RATIO_4_3).apply {
+                    val previewBuilderA = Preview.Builder().setResolutionSelector(
+                        ResolutionSelector.Builder()
+                            .setAspectRatioStrategy(
+                                AspectRatioStrategy(
+                                    androidx.camera.core.AspectRatio.RATIO_4_3,
+                                    AspectRatioStrategy.FALLBACK_RULE_AUTO
+                                )
+                            ).build()
+                    ).apply {
                         if (primary.parentLogicalId != null && android.os.Build.VERSION.SDK_INT >= 28) {
                             androidx.camera.camera2.interop.Camera2Interop.Extender(this).setPhysicalCameraId(primary.id)
                         }
@@ -458,11 +483,20 @@ fun PreviewAndControlLayout(
                         val cameraA = cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelectorA, previewBuilderA, capA)
                         previewBuilderA.setSurfaceProvider(previewViewA.surfaceProvider)
                         cameraControlA = cameraA.cameraControl
+                        activeCaptureA = capA
                     } catch (e: Exception) { Log.e("CameraBinding", "Failed A", e) }
 
-                    if (logicalIdA != logicalIdB) {
+                    if (logicalIdA != logicalIdB && uiState.concurrentPreviewSupported) {
                         val cameraSelectorB = findCameraSelector(cameraProvider, logicalIdB)
-                        val previewBuilderB = Preview.Builder().setTargetAspectRatio(androidx.camera.core.AspectRatio.RATIO_4_3).apply {
+                        val previewBuilderB = Preview.Builder().setResolutionSelector(
+                            ResolutionSelector.Builder()
+                                .setAspectRatioStrategy(
+                                    AspectRatioStrategy(
+                                        androidx.camera.core.AspectRatio.RATIO_4_3,
+                                        AspectRatioStrategy.FALLBACK_RULE_AUTO
+                                    )
+                                ).build()
+                        ).apply {
                             if (secondary.parentLogicalId != null && android.os.Build.VERSION.SDK_INT >= 28) {
                                 androidx.camera.camera2.interop.Camera2Interop.Extender(this).setPhysicalCameraId(secondary.id)
                             }
@@ -472,11 +506,11 @@ fun PreviewAndControlLayout(
                             val cameraB = cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelectorB, previewBuilderB, capB)
                             previewBuilderB.setSurfaceProvider(previewViewB.surfaceProvider)
                             cameraControlB = cameraB.cameraControl
+                            activeCaptureB = capB
+                            cameraXPairReady = true
                         } catch (e: Exception) { Log.e("CameraBinding", "Failed B", e) }
                     } else {
-                        // We cannot bind B if it's the exact same logical camera and uses CameraX.
-                        // We'll just leave B empty if DualCameraManager didn't catch it
-                        Log.e("CameraBinding", "Cannot bind two previews to same logical camera in CameraX fallback.")
+                        Log.d("CameraBinding", "Using sequential capture fallback for secondary lens.")
                     }
 
                 } catch (e: Exception) {
@@ -488,99 +522,191 @@ fun PreviewAndControlLayout(
         onDispose {
             dualManager?.stop()
             dualManager = null
+            cameraXPairReady = false
+            textureViewA.cleanup()
+            textureViewB.cleanup()
         }
     }
     
-    val executeCapture = remember(usingDualManager, dualManager, activeCaptureA, activeCaptureB) {
-        {
-            if (!isCapturing && !uiState.isCapturing) {
-                isCapturing = true
-                if (usingDualManager && dualManager != null) {
-                    dualManager?.takePicture()
+    val coroutineScope = rememberCoroutineScope()
+
+    suspend fun runStillCountdown() {
+        for (count in 3 downTo 1) {
+            stillCountdown = count
+            delay(700)
+        }
+        stillCountdown = 0
+        delay(180)
+    }
+
+    suspend fun captureSelectedLensesSequentially(): List<Bitmap> {
+        val selectedLenses = mutableListOf<CameraLensDetails>()
+        uiState.primaryLens?.let { selectedLenses.add(it) }
+        if (uiState.lensCount <= 2) {
+            uiState.secondaryLens?.let { selectedLenses.add(it) }
+        } else {
+            selectedLenses.addAll(uiState.secondaryLenses)
+        }
+
+        val capturedBitmaps = mutableListOf<Bitmap>()
+        val uniqueLenses = selectedLenses.distinctBy { it.id }
+        for ((index, lens) in uniqueLenses.withIndex()) {
+            val limits = uiState.zoomLimitsMap[lens.id] ?: Pair(1f, 3f)
+            val zoom = (uiState.zoomMap[lens.id] ?: 1f).coerceIn(limits.first, limits.second)
+            val bitmap = try {
+                if (index == 0 && lens.id == uiState.primaryLens?.id && activeCaptureA != null) {
+                    val activePrimaryBitmap = try {
+                        try {
+                            cameraControlA?.setZoomRatio(zoom)?.await(context)
+                        } catch (e: Exception) {
+                            Log.w("WiggleApp", "Could not apply primary zoom before sequential capture", e)
+                        }
+                        captureCameraXBitmap(activeCaptureA!!, mainExecutor)
+                    } catch (e: Exception) {
+                        Log.w("WiggleApp", "Active primary capture failed; rebinding lens ${lens.id}", e)
+                        null
+                    }
+                    activePrimaryBitmap ?: captureLensStillFrame(
+                        context = context,
+                        lifecycleOwner = lifecycleOwner,
+                        previewView = previewViewA,
+                        lens = lens,
+                        zoom = zoom,
+                        is4K = uiState.is4K,
+                        mainExecutor = mainExecutor,
+                        settleDelayMs = 220L
+                    )
                 } else {
-                    val cA = activeCaptureA
-                    val cB = activeCaptureB
-                    
-                    if (cA != null && cB != null) {
-                        var bitmapA: Bitmap? = null
-                        var bitmapB: Bitmap? = null
-                        
-                        val checkComplete = {
+                    captureLensStillFrame(
+                        context = context,
+                        lifecycleOwner = lifecycleOwner,
+                        previewView = previewViewA,
+                        lens = lens,
+                        zoom = zoom,
+                        is4K = uiState.is4K,
+                        mainExecutor = mainExecutor,
+                        settleDelayMs = if (index == 0) 220L else 140L
+                    )
+                }
+            } catch (e: Exception) {
+                Log.e("WiggleApp", "Sequential capture failed for lens ${lens.id}", e)
+                null
+            }
+
+            if (bitmap != null) {
+                capturedBitmaps.add(bitmap)
+            } else {
+                Log.e("WiggleApp", "Sequential capture returned no bitmap for lens ${lens.id}")
+            }
+        }
+        return capturedBitmaps
+    }
+
+    val executeCapture = {
+        if (!isCapturing && !uiState.isCapturing) {
+            isCapturing = true
+
+            val canUseDualManager = uiState.lensCount == 2 && usingDualManager && dualManager != null
+            val canUseCameraXPair = uiState.lensCount == 2 && !usingDualManager && cameraXPairReady && activeCaptureA != null && activeCaptureB != null
+
+            if (canUseDualManager) {
+                val mgr = dualManager
+                if (mgr != null) {
+                    mgr.takePicture()
+                    captureTimeoutJob?.cancel()
+                    captureTimeoutJob = coroutineScope.launch {
+                        kotlinx.coroutines.delay(5000)
+                        if (isCapturing) {
+                            isCapturing = false
+                            Toast.makeText(context, "Aufnahme Timeout", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                } else {
+                    isCapturing = false
+                    Toast.makeText(context, "Kamera nicht bereit", Toast.LENGTH_SHORT).show()
+                }
+            } else if (canUseCameraXPair) {
+                val cA = activeCaptureA
+                val cB = activeCaptureB
+
+                if (cA != null && cB != null) {
+                    var bitmapA: Bitmap? = null
+                    var bitmapB: Bitmap? = null
+                    val captureCounter = AtomicInteger(2)
+
+                    captureTimeoutJob?.cancel()
+                    captureTimeoutJob = coroutineScope.launch {
+                        kotlinx.coroutines.delay(5000)
+                        if (isCapturing) {
+                            isCapturing = false
+                            Toast.makeText(context, "Aufnahme Timeout", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+
+                    val checkComplete = {
+                        if (captureCounter.decrementAndGet() == 0) {
+                            captureTimeoutJob?.cancel()
                             if (bitmapA != null && bitmapB != null) {
                                 onCapture(bitmapA, bitmapB)
-                                isCapturing = false
+                            } else {
+                                Toast.makeText(context, "Aufnahme fehlgeschlagen", Toast.LENGTH_SHORT).show()
+                            }
+                            isCapturing = false
+                        }
+                    }
+
+                    cA.takePicture(mainExecutor, object : ImageCapture.OnImageCapturedCallback() {
+                        override fun onCaptureSuccess(image: ImageProxy) {
+                            try {
+                                bitmapA = imageProxyToBitmap(image)
+                            } finally {
+                                image.close()
+                                checkComplete()
                             }
                         }
 
-                        cA.takePicture(mainExecutor, object : ImageCapture.OnImageCapturedCallback() {
-                            override fun onCaptureSuccess(image: androidx.camera.core.ImageProxy) {
-                            val matrix = android.graphics.Matrix()
-                            matrix.postRotate(image.imageInfo.rotationDegrees.toFloat())
-                            
-                            val buffer = image.planes[0].buffer
-                            val bytes = ByteArray(buffer.remaining())
-                            buffer.get(bytes)
-                            val tempBitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                            
-                            val crop = image.cropRect
-                            val scaleX = tempBitmap.width.toFloat() / image.width.toFloat()
-                            val scaleY = tempBitmap.height.toFloat() / image.height.toFloat()
-                            
-                            // Account for potential rounding errors
-                            val cw = (crop.width() * scaleX).toInt().coerceAtMost(tempBitmap.width)
-                            val ch = (crop.height() * scaleY).toInt().coerceAtMost(tempBitmap.height)
-                            val cx = (crop.left * scaleX).toInt().coerceAtMost(tempBitmap.width - cw)
-                            val cy = (crop.top * scaleY).toInt().coerceAtMost(tempBitmap.height - ch)
-                            
-                            matrix.postScale(tempBitmap.width.toFloat() / cw, tempBitmap.height.toFloat() / ch)
-                            
-                            bitmapA = android.graphics.Bitmap.createBitmap(
-                                tempBitmap, cx, cy, cw, ch, matrix, true
-                            )
-                            image.close()
-                            checkComplete()
-                        }
                         override fun onError(exception: ImageCaptureException) {
                             Log.e("Wiggle", "Capture A failed", exception)
-                            isCapturing = false
-                        }
-                    })
-                    
-                    cB.takePicture(mainExecutor, object : ImageCapture.OnImageCapturedCallback() {
-                        override fun onCaptureSuccess(image: androidx.camera.core.ImageProxy) {
-                            val matrix = android.graphics.Matrix()
-                            matrix.postRotate(image.imageInfo.rotationDegrees.toFloat())
-                            
-                            val buffer = image.planes[0].buffer
-                            val bytes = ByteArray(buffer.remaining())
-                            buffer.get(bytes)
-                            val tempBitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                            
-                            val crop = image.cropRect
-                            val scaleX = tempBitmap.width.toFloat() / image.width.toFloat()
-                            val scaleY = tempBitmap.height.toFloat() / image.height.toFloat()
-                            
-                            val cw = (crop.width() * scaleX).toInt().coerceAtMost(tempBitmap.width)
-                            val ch = (crop.height() * scaleY).toInt().coerceAtMost(tempBitmap.height)
-                            val cx = (crop.left * scaleX).toInt().coerceAtMost(tempBitmap.width - cw)
-                            val cy = (crop.top * scaleY).toInt().coerceAtMost(tempBitmap.height - ch)
-                            
-                            matrix.postScale(tempBitmap.width.toFloat() / cw, tempBitmap.height.toFloat() / ch)
-                            
-                            bitmapB = android.graphics.Bitmap.createBitmap(
-                                tempBitmap, cx, cy, cw, ch, matrix, true
-                            )
-                            image.close()
                             checkComplete()
                         }
+                    })
+
+                    cB.takePicture(mainExecutor, object : ImageCapture.OnImageCapturedCallback() {
+                        override fun onCaptureSuccess(image: ImageProxy) {
+                            try {
+                                bitmapB = imageProxyToBitmap(image)
+                            } finally {
+                                image.close()
+                                checkComplete()
+                            }
+                        }
+
                         override fun onError(exception: ImageCaptureException) {
                             Log.e("Wiggle", "Capture B failed", exception)
-                            isCapturing = false
+                            checkComplete()
                         }
                     })
-                    } else {
-                        Toast.makeText(context, "Kameras nicht bereit", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(context, "Kameras nicht bereit", Toast.LENGTH_SHORT).show()
+                    isCapturing = false
+                }
+            } else {
+                coroutineScope.launch {
+                    try {
+                        runStillCountdown()
+                        val capturedBitmaps = captureSelectedLensesSequentially()
+                        if (capturedBitmaps.size >= 2) {
+                            viewModel.performMultiCapture(context, capturedBitmaps)
+                        } else {
+                            Toast.makeText(context, "Aufnahme fehlgeschlagen", Toast.LENGTH_SHORT).show()
+                        }
+                    } catch (e: Exception) {
+                        Log.e("WiggleApp", "Sequential capture failed", e)
+                        Toast.makeText(context, "Aufnahme fehlgeschlagen", Toast.LENGTH_SHORT).show()
+                    } finally {
+                        stillCountdown = null
                         isCapturing = false
+                        cameraRestartToken += 1
                     }
                 }
             }
@@ -623,72 +749,58 @@ fun PreviewAndControlLayout(
                 modifier = Modifier.fillMaxSize().alpha(if (!usingDualManager) 1f else 0f)
             )
         }
+
+        if (stillCountdown != null) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color(0xAA000000)),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        text = if (stillCountdown == 0) "JETZT STILL" else stillCountdown.toString(),
+                        fontSize = if (stillCountdown == 0) 30.sp else 64.sp,
+                        fontWeight = FontWeight.Black,
+                        color = Color.White,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text(
+                        text = "Bitte ganz ruhig halten",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF00FFCC),
+                        textAlign = TextAlign.Center
+                    )
+                }
+            }
+        }
         
-        // Settings Overlay / Lens Selection Top Left
+        // Camera Mode Indicator Pill Top Left
         Box(
             modifier = Modifier
                 .align(Alignment.TopStart)
                 .padding(12.dp)
                 .background(Color(0xD90D0F12), RoundedCornerShape(12.dp))
                 .border(1.dp, Color(0xFF232A38), RoundedCornerShape(12.dp))
-                .padding(12.dp)
+                .padding(horizontal = 12.dp, vertical = 8.dp)
         ) {
-            Column {
-                Text(
-                    text = "LENS CONFIGURATION",
-                    fontSize = 10.sp,
-                    fontWeight = FontWeight.Black,
-                    color = Color.Gray,
-                    modifier = Modifier.padding(bottom = 8.dp)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                val simultaneousReady = uiState.lensCount == 2 && ((usingDualManager && dualManager != null) || cameraXPairReady)
+                Box(
+                    modifier = Modifier
+                        .size(8.dp)
+                        .background(if (simultaneousReady) Color(0xFF00FFCC) else Color(0xFFFFCC00), CircleShape)
                 )
-                
-                var expandedA by remember { mutableStateOf(false) }
-                Column(modifier = Modifier.clickable { expandedA = true }.fillMaxWidth(0.6f).padding(vertical = 4.dp)) {
-                    Text(text = "LENS A", fontSize = 10.sp, color = Color(0xFF00FFCC), fontWeight = FontWeight.Bold)
-                    Text(
-                        text = uiState.primaryLens?.name ?: "Unknown",
-                        fontSize = 12.sp,
-                        color = Color.White,
-                        fontWeight = FontWeight.Medium
-                    )
-                }
-                DropdownMenu(expanded = expandedA, onDismissRequest = { expandedA = false }) {
-                    uiState.availableLenses.forEach { lens ->
-                        DropdownMenuItem(
-                            text = { Text(lens.name, fontSize = 12.sp) },
-                            onClick = {
-                                viewModel.setPrimaryLens(lens)
-                                expandedA = false
-                            }
-                        )
-                    }
-                }
-                
-                Spacer(modifier = Modifier.height(4.dp))
-                Box(modifier = Modifier.fillMaxWidth(0.6f).height(1.dp).background(Color(0xFF232A38)))
-                Spacer(modifier = Modifier.height(4.dp))
-                
-                var expandedB by remember { mutableStateOf(false) }
-                Column(modifier = Modifier.clickable { expandedB = true }.fillMaxWidth(0.6f).padding(vertical = 4.dp)) {
-                    Text(text = "LENS B", fontSize = 10.sp, color = Color(0xFF00FFCC), fontWeight = FontWeight.Bold)
-                    Text(
-                        text = uiState.secondaryLens?.name ?: "Unknown",
-                        fontSize = 12.sp,
-                        color = Color.White,
-                        fontWeight = FontWeight.Medium
-                    )
-                }
-                DropdownMenu(expanded = expandedB, onDismissRequest = { expandedB = false }) {
-                    uiState.availableLenses.forEach { lens ->
-                        DropdownMenuItem(
-                            text = { Text(lens.name, fontSize = 12.sp) },
-                            onClick = {
-                                viewModel.setSecondaryLens(lens)
-                                expandedB = false
-                            }
-                        )
-                    }
-                }
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = if (simultaneousReady) "SIMULTAN (2 Linsen)" else "SEQUENTIELL (${uiState.lensCount} Linsen)",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Black,
+                    color = Color.White,
+                    letterSpacing = 0.5.sp
+                )
             }
         }
 
@@ -708,91 +820,236 @@ fun PreviewAndControlLayout(
                     color = Color(0xFF00FFCC)
                 )
                 Text(
-                    text = "Hauptlinse live",
+                    text = "Kamera live",
                     fontSize = 8.sp,
                     color = Color.LightGray
                 )
             }
         }
         
-        // Zoom Controls Bottom Left & Right
-        Row(
+        // Dynamic Zoom Controls Bottom
+        Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp)
-                .padding(bottom = 120.dp),
-            horizontalArrangement = Arrangement.spacedBy(16.dp)
+                .padding(bottom = 120.dp)
+                .background(Color(0xCC0D0F12), RoundedCornerShape(16.dp))
+                .border(1.dp, Color(0xFF232A38), RoundedCornerShape(16.dp))
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .background(Color(0x990D0F12), RoundedCornerShape(8.dp))
-                    .padding(8.dp)
-            ) {
+            // Primary Lens Slider
+            val pLens = uiState.primaryLens
+            if (pLens != null) {
+                val pLimits = uiState.zoomLimitsMap[pLens.id] ?: Pair(1f, 3f)
+                val pZoom = (uiState.zoomMap[pLens.id] ?: 1.0f).coerceIn(pLimits.first, pLimits.second)
                 Column {
-                    Text(
-                        text = "ZOOM A: ${String.format(java.util.Locale.US, "%.1fx", uiState.zoomA)}",
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color(0xFF00FFCC)
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "ZOOM (HAUPTLINSE): ${String.format(java.util.Locale.US, "%.2fx", pZoom)}",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFF00FFCC)
+                        )
+                        Text(
+                            text = pLens.name,
+                            fontSize = 8.sp,
+                            color = Color.Gray
+                        )
+                    }
                     Slider(
-                        value = uiState.zoomA,
-                        onValueChange = { viewModel.setZoomA(it) },
-                        valueRange = 1f..5f,
-                        steps = 39,
+                        value = pZoom,
+                        onValueChange = { viewModel.setZoomForLens(pLens.id, it) },
+                        valueRange = pLimits.first..pLimits.second,
                         modifier = Modifier.height(24.dp)
                     )
                 }
             }
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .background(Color(0x990D0F12), RoundedCornerShape(8.dp))
-                    .padding(8.dp)
-            ) {
+
+            // Slider for each active secondary lens
+            uiState.secondaryLenses.forEachIndexed { index, sLens ->
+                val sLimits = uiState.zoomLimitsMap[sLens.id] ?: Pair(1f, 3f)
+                val sZoom = (uiState.zoomMap[sLens.id] ?: 1.0f).coerceIn(sLimits.first, sLimits.second)
                 Column {
                     Row(
-                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
-                        modifier = Modifier.fillMaxWidth()
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "ZOOM B: ${String.format(java.util.Locale.US, "%.2fx", uiState.zoomB)}",
+                            text = "ZOOM (SEKUNDÄRLINSE ${index + 1}): ${String.format(java.util.Locale.US, "%.2fx", sZoom)}",
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
                             color = Color.White
                         )
-                        Box(
-                            modifier = Modifier
-                                .background(
-                                    if (uiState.isAutoZoomApplied) Color(0xFF00FFCC) else Color(0xFF232A38),
-                                    RoundedCornerShape(4.dp)
-                                )
-                                .clickable {
-                                    val w = textureViewA.width
-                                    val h = textureViewA.height
-                                    val bmpA = if (w > 0 && h > 0) textureViewA.getBitmap(w, h) else textureViewA.bitmap
-                                    val bmpB = if (w > 0 && h > 0) textureViewB.getBitmap(w, h) else textureViewB.bitmap
-                                    viewModel.autoCalibrateFOV(bmpA, bmpB)
-                                }
-                                .padding(horizontal = 6.dp, vertical = 2.dp)
-                        ) {
-                            Text(
-                                text = "AUTO",
-                                fontSize = 8.sp,
-                                fontWeight = FontWeight.Black,
-                                color = if (uiState.isAutoZoomApplied) Color.Black else Color.White
-                            )
-                        }
+                        Text(
+                            text = sLens.name,
+                            fontSize = 8.sp,
+                            color = Color.Gray
+                        )
                     }
                     Slider(
-                        value = uiState.zoomB,
-                        onValueChange = { viewModel.setZoomB(it) },
-                        valueRange = 1f..3f,
+                        value = sZoom,
+                        onValueChange = { viewModel.setZoomForLens(sLens.id, it) },
+                        valueRange = sLimits.first..sLimits.second,
                         modifier = Modifier.height(24.dp)
                     )
+                }
+            }
+
+            // Auto-Zoom Calibration Button
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.Center
+            ) {
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(
+                            if (uiState.isCalibrating) Color(0xFF2C3545)
+                            else if (uiState.isAutoZoomApplied) Color(0xFF00FFCC)
+                            else Color(0xFF1E2430)
+                        )
+                        .border(
+                            1.dp,
+                            if (uiState.isCalibrating) Color(0xFF3B485E)
+                            else if (uiState.isAutoZoomApplied) Color(0xFF00FFCC)
+                            else Color(0xFF232A38),
+                            RoundedCornerShape(10.dp)
+                        )
+                        .clickable(enabled = !uiState.isCalibrating) {
+                            coroutineScope.launch {
+                                val freshState = viewModel.uiState.value
+                                viewModel.setCalibrating(true)
+                                var restartCameraAfterCalibration = false
+                                try {
+                                    kotlinx.coroutines.withTimeout(15_000L) {
+                                        val results = mutableMapOf<String, MutableList<Float>>()
+                                        val originalSecondary = freshState.secondaryLens
+                                        val originalZoomB = freshState.zoomB
+                                        val primaryLens = freshState.primaryLens
+                                        val useSequentialCalibration = !usingDualManager && !cameraXPairReady
+                                        restartCameraAfterCalibration = useSequentialCalibration
+                                        
+                                        // Loop through all secondary lenses
+                                        for (lens in freshState.secondaryLenses) {
+                                            if (freshState.secondaryLens?.id != lens.id) {
+                                                viewModel.setSecondaryLens(lens)
+                                                delay(if (useSequentialCalibration) 150 else 800)
+                                            }
+                                            
+                                            val limits = freshState.zoomLimitsMap[lens.id] ?: Pair(1.0f, 3.0f)
+                                            val minZoom = limits.first.coerceAtLeast(1.0f)
+                                            val maxZoom = limits.second
+                                            val passes = 3
+
+                                            if (!useSequentialCalibration) {
+                                                viewModel.setZoomB(minZoom)
+                                                delay(400)
+                                            }
+                                            
+                                            // Run visual matching multiple times and collect results
+                                            for (i in 0 until passes) {
+                                                val bmpPrimary = when {
+                                                    usingDualManager -> textureViewA.getBitmap(640, 480)
+                                                    useSequentialCalibration && primaryLens != null -> captureLensStillFrame(
+                                                        context = context,
+                                                        lifecycleOwner = lifecycleOwner,
+                                                        previewView = previewViewA,
+                                                        lens = primaryLens,
+                                                        zoom = freshState.zoomMap[primaryLens.id] ?: 1f,
+                                                        is4K = freshState.is4K,
+                                                        mainExecutor = mainExecutor,
+                                                        settleDelayMs = 250L
+                                                    )
+                                                    else -> previewViewA.bitmap
+                                                }
+                                                
+                                                val bmpSecondary = when {
+                                                    usingDualManager -> textureViewB.getBitmap(640, 480)
+                                                    useSequentialCalibration -> captureLensStillFrame(
+                                                        context = context,
+                                                        lifecycleOwner = lifecycleOwner,
+                                                        previewView = previewViewA,
+                                                        lens = lens,
+                                                        zoom = minZoom,
+                                                        is4K = freshState.is4K,
+                                                        mainExecutor = mainExecutor,
+                                                        settleDelayMs = 250L
+                                                    )
+                                                    else -> previewViewB.bitmap
+                                                }
+                                                
+                                                if (bmpPrimary != null && bmpSecondary != null && bmpSecondary.width > 50 && bmpSecondary.height > 50) {
+                                                    val bestZoom = viewModel.calculateVisualZoomMatch(bmpPrimary, bmpSecondary, minZoom, maxZoom)
+                                                    results.getOrPut(lens.id) { mutableListOf() }.add(bestZoom)
+                                                } else {
+                                                    android.util.Log.e("WiggleApp", "Cannot calibrate iteration $i for lens ${lens.id}: bmpPrimary=$bmpPrimary, bmpSecondary=$bmpSecondary")
+                                                }
+                                                
+                                                if (i < passes - 1) {
+                                                    delay(if (useSequentialCalibration) 120 else 100)
+                                                }
+                                            }
+                                        }
+                                        
+                                        // Restore original secondary lens and zoom if we switched it
+                                        if (originalSecondary != null && freshState.secondaryLens?.id != originalSecondary.id) {
+                                            viewModel.setSecondaryLens(originalSecondary)
+                                            viewModel.setZoomB(originalZoomB)
+                                            delay(500)
+                                        }
+                                        
+                                        if (results.isEmpty() || results.values.all { it.isEmpty() }) {
+                                            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                                                Toast.makeText(context, "Kalibrierung fehlgeschlagen – Kamera nicht bereit", Toast.LENGTH_SHORT).show()
+                                            }
+                                        } else {
+                                            viewModel.applyCalibrationResults(results)
+                                        }
+                                    }
+                                } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+                                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                                        Toast.makeText(context, "Kalibrierung Timeout", Toast.LENGTH_SHORT).show()
+                                    }
+                                } catch (e: Exception) {
+                                    android.util.Log.e("WiggleApp", "Error during ML calibration", e)
+                                    viewModel.setCalibrating(false)
+                                } finally {
+                                    viewModel.setCalibrating(false)
+                                    if (restartCameraAfterCalibration) {
+                                        cameraRestartToken += 1
+                                    }
+                                }
+                            }
+                        }
+                        .padding(horizontal = 16.dp, vertical = 6.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        if (uiState.isCalibrating) {
+                            CircularProgressIndicator(
+                                color = Color(0xFF00FFCC),
+                                modifier = Modifier.size(12.dp),
+                                strokeWidth = 1.5.dp
+                            )
+                        }
+                        Text(
+                            text = if (uiState.isCalibrating) "KALIBRIERE..." else if (uiState.isAutoZoomApplied) "✓ AUTO" else "⚡ AUTO KALIBRIERUNG",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Black,
+                            color = if (uiState.isCalibrating) Color(0xFF8A94A6) else if (uiState.isAutoZoomApplied) Color.Black else Color(0xFF00FFCC),
+                            letterSpacing = 0.5.sp
+                        )
+                    }
                 }
             }
         }
@@ -844,62 +1101,248 @@ fun updateTextureViewTransform(
     viewWidth: Float, 
     viewHeight: Float, 
     zoom: Float,
-    sensorOrientation: Int = 90
+    sensorOrientation: Int = 90,
+    bufferWidth: Float = 1440f,
+    bufferHeight: Float = 1080f
 ) {
-    val matrix = android.graphics.Matrix()
     if (viewWidth == 0f || viewHeight == 0f) return
 
+    val matrix = android.graphics.Matrix()
     val centerX = viewWidth / 2f
     val centerY = viewHeight / 2f
 
-    // We assume the camera buffer is generally a 4:3 landscape stream like 1440x1080
-    val bufferWidth = 1440f
-    val bufferHeight = 1080f
+    // 1. Keine zusätzliche Rotation der TextureView nötig, da die SurfaceTexture
+    //    den Preview-Stream bereits intern an die native Geräteausrichtung (Portrait) anpasst.
+    val rotation = 0f
+    matrix.postRotate(rotation, centerX, centerY)
 
-    // 1. Un-stretch to actual stream ratio
-    matrix.postScale(bufferWidth / viewWidth, bufferHeight / viewHeight, centerX, centerY)
-    
-    // 2. Rotate it based on sensor orientation
-    matrix.postRotate(sensorOrientation.toFloat(), centerX, centerY)
-    
-    // 3. Center crop to fill the container view without distortion
-    val rotatedWidth = if (sensorOrientation % 180 != 0) bufferHeight else bufferWidth
-    val rotatedHeight = if (sensorOrientation % 180 != 0) bufferWidth else bufferHeight
-    val scaleFill = maxOf(viewWidth / rotatedWidth, viewHeight / rotatedHeight)
-    matrix.postScale(scaleFill, scaleFill, centerX, centerY)
-    
-    // 4. Apply manual/auto zoom crop
+    // 2. Nach der internen SurfaceTexture-Rotation liegt der Buffer bereits im Hochformat vor.
+    //    Daher sind Breite und Höhe vertauscht:
+    val bufferPortraitWidth = bufferHeight
+    val bufferPortraitHeight = bufferWidth
+
+    // 3. Gleichmäßige Skalierung (Center-Crop) zur Beseitigung von Verzerrungen
+    val scaleFill = maxOf(viewWidth / bufferPortraitWidth, viewHeight / bufferPortraitHeight)
+    val scaleX = scaleFill * (bufferPortraitWidth / viewWidth)
+    val scaleY = scaleFill * (bufferPortraitHeight / viewHeight)
+    matrix.postScale(scaleX, scaleY, centerX, centerY)
+
+    // 4. Manueller/Automatischer Zoom
     matrix.postScale(zoom, zoom, centerX, centerY)
-    
+
     textureView.setTransform(matrix)
 }
 
 class ZoomableTextureView(context: Context) : android.view.TextureView(context) {
     var currentZoom: Float = 1f
     var sensorOrientation: Int = 90
-        set(value) {
-            field = value
-            if (lastWidth > 0 && lastHeight > 0) {
-                updateTextureViewTransform(this, lastWidth, lastHeight, currentZoom, field)
-            }
-        }
-    var lastWidth: Float = 0f
-    var lastHeight: Float = 0f
+        set(value) { field = value; applyTransform() }
+    var bufferWidth: Float = 1440f
+        set(value) { field = value; applyTransform() }
+    var bufferHeight: Float = 1080f
+        set(value) { field = value; applyTransform() }
+    private var lastWidth: Float = 0f
+    private var lastHeight: Float = 0f
+
+    private val layoutListener = android.view.View.OnLayoutChangeListener { _, left, top, right, bottom, _, _, _, _ ->
+        lastWidth = (right - left).toFloat()
+        lastHeight = (bottom - top).toFloat()
+        applyTransform()
+    }
 
     init {
-        addOnLayoutChangeListener { _, left, top, right, bottom, _, _, _, _ ->
-            lastWidth = (right - left).toFloat()
-            lastHeight = (bottom - top).toFloat()
-            updateTextureViewTransform(this, lastWidth, lastHeight, currentZoom, sensorOrientation)
+        addOnLayoutChangeListener(layoutListener)
+    }
+
+    private fun applyTransform() {
+        if (lastWidth > 0 && lastHeight > 0) {
+            updateTextureViewTransform(this, lastWidth, lastHeight, currentZoom, sensorOrientation, bufferWidth, bufferHeight)
         }
     }
 
     fun updateZoom(newZoom: Float) {
         currentZoom = newZoom
-        if (lastWidth > 0 && lastHeight > 0) {
-            updateTextureViewTransform(this, lastWidth, lastHeight, currentZoom, sensorOrientation)
-        }
+        applyTransform()
     }
+
+    fun cleanup() {
+        removeOnLayoutChangeListener(layoutListener)
+    }
+}
+
+private fun buildCaptureResolutionSelector(is4K: Boolean): androidx.camera.core.resolutionselector.ResolutionSelector {
+    val resolutionStrategy = if (is4K) {
+        androidx.camera.core.resolutionselector.ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY
+    } else {
+        androidx.camera.core.resolutionselector.ResolutionStrategy(
+            android.util.Size(1920, 1440),
+            androidx.camera.core.resolutionselector.ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER
+        )
+    }
+    return androidx.camera.core.resolutionselector.ResolutionSelector.Builder()
+        .setAspectRatioStrategy(
+            androidx.camera.core.resolutionselector.AspectRatioStrategy(
+                androidx.camera.core.AspectRatio.RATIO_4_3,
+                androidx.camera.core.resolutionselector.AspectRatioStrategy.FALLBACK_RULE_AUTO
+            )
+        )
+        .setResolutionStrategy(resolutionStrategy)
+        .build()
+}
+
+private suspend fun captureLensStillFrame(
+    context: Context,
+    lifecycleOwner: androidx.lifecycle.LifecycleOwner,
+    previewView: PreviewView,
+    lens: CameraLensDetails,
+    zoom: Float,
+    is4K: Boolean,
+    mainExecutor: Executor,
+    settleDelayMs: Long
+): Bitmap? {
+    val cameraProvider = ProcessCameraProvider.getInstance(context).await(context)
+    cameraProvider.unbindAll()
+
+    val logicalId = lens.parentLogicalId ?: lens.id
+    val imageCaptureBuilder = ImageCapture.Builder()
+        .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+        .setResolutionSelector(buildCaptureResolutionSelector(is4K))
+    if (lens.parentLogicalId != null && android.os.Build.VERSION.SDK_INT >= 28) {
+        androidx.camera.camera2.interop.Camera2Interop.Extender(imageCaptureBuilder)
+            .setPhysicalCameraId(lens.id)
+    }
+    val imageCapture = imageCaptureBuilder.build()
+
+    val previewBuilder = Preview.Builder()
+        .setResolutionSelector(
+            ResolutionSelector.Builder()
+                .setAspectRatioStrategy(
+                    AspectRatioStrategy(
+                        androidx.camera.core.AspectRatio.RATIO_4_3,
+                        AspectRatioStrategy.FALLBACK_RULE_AUTO
+                    )
+                ).build()
+        )
+    val previewExtender = androidx.camera.camera2.interop.Camera2Interop.Extender(previewBuilder)
+    if (lens.parentLogicalId != null && android.os.Build.VERSION.SDK_INT >= 28) {
+        previewExtender.setPhysicalCameraId(lens.id)
+    }
+
+    // After a full unbind/rebind the auto-exposure and auto-white-balance loops
+    // restart from scratch. Capturing a calibration frame before 3A has
+    // converged yields frames with unpredictable brightness, which makes the
+    // ZNCC zoom match non-deterministic across app starts. Monitor the preview
+    // capture results and wait until AE + AWB report a stable state.
+    val converged = kotlinx.coroutines.CompletableDeferred<Unit>()
+    var stableFrames = 0
+    previewExtender.setSessionCaptureCallback(
+        object : android.hardware.camera2.CameraCaptureSession.CaptureCallback() {
+            override fun onCaptureCompleted(
+                session: android.hardware.camera2.CameraCaptureSession,
+                request: android.hardware.camera2.CaptureRequest,
+                result: android.hardware.camera2.TotalCaptureResult
+            ) {
+                val aeState = result.get(android.hardware.camera2.CaptureResult.CONTROL_AE_STATE)
+                val awbState = result.get(android.hardware.camera2.CaptureResult.CONTROL_AWB_STATE)
+                val aeStable = aeState == null ||
+                    aeState == android.hardware.camera2.CaptureResult.CONTROL_AE_STATE_CONVERGED ||
+                    aeState == android.hardware.camera2.CaptureResult.CONTROL_AE_STATE_LOCKED ||
+                    aeState == android.hardware.camera2.CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED
+                val awbStable = awbState == null ||
+                    awbState == android.hardware.camera2.CaptureResult.CONTROL_AWB_STATE_CONVERGED ||
+                    awbState == android.hardware.camera2.CaptureResult.CONTROL_AWB_STATE_LOCKED
+                if (aeStable && awbStable) {
+                    stableFrames += 1
+                    if (stableFrames >= AE_STABLE_FRAME_COUNT && !converged.isCompleted) {
+                        converged.complete(Unit)
+                    }
+                } else {
+                    stableFrames = 0
+                }
+            }
+        }
+    )
+    val preview = previewBuilder.build()
+    preview.setSurfaceProvider(previewView.surfaceProvider)
+
+    val cameraSelector = findCameraSelector(cameraProvider, logicalId)
+    val camera = cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, imageCapture)
+    try {
+        camera.cameraControl.setZoomRatio(zoom).await(context)
+    } catch (e: Exception) {
+        Log.w("WiggleApp", "Could not apply zoom before sequential lens capture", e)
+    }
+    val didConverge = kotlinx.coroutines.withTimeoutOrNull(AE_CONVERGENCE_TIMEOUT_MS) {
+        converged.await()
+    } != null
+    if (!didConverge) {
+        Log.w("WiggleApp", "3A did not converge within ${AE_CONVERGENCE_TIMEOUT_MS}ms for lens ${lens.id}; capturing anyway")
+    }
+    delay(settleDelayMs)
+
+    return captureCameraXBitmap(imageCapture, mainExecutor)
+}
+
+// Number of consecutive preview frames that must report stable AE/AWB before a
+// calibration frame is captured, plus a hard timeout so calibration never hangs
+// on devices that do not report 3A states.
+private const val AE_STABLE_FRAME_COUNT = 3
+private const val AE_CONVERGENCE_TIMEOUT_MS = 2500L
+
+private suspend fun captureCameraXBitmap(
+    imageCapture: ImageCapture,
+    mainExecutor: Executor
+): Bitmap? {
+    return kotlinx.coroutines.suspendCancellableCoroutine { continuation ->
+        imageCapture.takePicture(mainExecutor, object : ImageCapture.OnImageCapturedCallback() {
+            override fun onCaptureSuccess(image: ImageProxy) {
+                try {
+                    continuation.resumeWith(Result.success(imageProxyToBitmap(image)))
+                } catch (e: Exception) {
+                    continuation.resumeWith(Result.failure(e))
+                } finally {
+                    image.close()
+                }
+            }
+
+            override fun onError(exception: ImageCaptureException) {
+                continuation.resumeWith(Result.failure(exception))
+            }
+        })
+    }
+}
+
+private fun imageProxyToBitmap(image: ImageProxy): Bitmap? {
+    val buffer = image.planes[0].buffer
+    val bytes = ByteArray(buffer.remaining())
+    buffer.get(bytes)
+    val tempBitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+
+    val crop = image.cropRect
+    val scaleX = tempBitmap.width.toFloat() / image.width.toFloat()
+    val scaleY = tempBitmap.height.toFloat() / image.height.toFloat()
+
+    val cropWidth = (crop.width() * scaleX).toInt().coerceIn(1, tempBitmap.width)
+    val cropHeight = (crop.height() * scaleY).toInt().coerceIn(1, tempBitmap.height)
+    val cropX = (crop.left * scaleX).toInt().coerceIn(0, tempBitmap.width - cropWidth)
+    val cropY = (crop.top * scaleY).toInt().coerceIn(0, tempBitmap.height - cropHeight)
+
+    val matrix = android.graphics.Matrix()
+    matrix.postRotate(image.imageInfo.rotationDegrees.toFloat())
+    matrix.postScale(
+        tempBitmap.width.toFloat() / cropWidth,
+        tempBitmap.height.toFloat() / cropHeight
+    )
+
+    return android.graphics.Bitmap.createBitmap(
+        tempBitmap,
+        cropX,
+        cropY,
+        cropWidth,
+        cropHeight,
+        matrix,
+        true
+    )
 }
 
 private fun findCameraSelector(cameraProvider: ProcessCameraProvider, cameraId: String): CameraSelector {
@@ -923,31 +1366,56 @@ fun WigglePlayerLayout(
     onCloseReview: () -> Unit
 ) {
     val context = LocalContext.current
-    var currentFrameIndex by remember { mutableStateOf(0) }
+    val coroutineScope = rememberCoroutineScope()
     
-    // Read files
-    val bitmapA = remember(capture.imageAPath) { WiggleProcessor.loadBitmap(capture.imageAPath) }
-    val bitmapB = remember(capture.imageBPath) { WiggleProcessor.loadBitmap(capture.imageBPath) }
+    // Read multi-frame image paths
+    val imagePaths = remember(capture.imagePaths) { capture.getImagePathList() }
+    val loadedBitmaps = remember(imagePaths) {
+        imagePaths.mapNotNull { WiggleProcessor.loadBitmap(it) }
+    }
 
-    // Playback loop controller (A -> B)
-    LaunchedEffect(Unit) {
+    var isPingPong by remember { mutableStateOf(true) }
+    var delayTimeMs by remember { mutableStateOf(250f) } // Default 250ms (4 fps)
+    
+    var currentFrameIndex by remember { mutableStateOf(0) }
+    var direction by remember { mutableStateOf(1) } // 1 for forward, -1 for backward
+
+    // Multi-frame looping playback logic
+    LaunchedEffect(loadedBitmaps, isPingPong, delayTimeMs) {
+        if (loadedBitmaps.isEmpty()) return@LaunchedEffect
+        
         while (true) {
-            val delayMs = 250L // 4 fps simple toggle
-            delay(delayMs)
-            currentFrameIndex = (currentFrameIndex + 1) % 2
+            delay(delayTimeMs.toLong())
+            
+            if (isPingPong) {
+                if (loadedBitmaps.size <= 1) {
+                    currentFrameIndex = 0
+                } else {
+                    val nextIndex = currentFrameIndex + direction
+                    if (nextIndex >= loadedBitmaps.size) {
+                        direction = -1
+                        currentFrameIndex = (loadedBitmaps.size - 2).coerceAtLeast(0)
+                    } else if (nextIndex < 0) {
+                        direction = 1
+                        currentFrameIndex = 1.coerceAtMost(loadedBitmaps.size - 1)
+                    } else {
+                        currentFrameIndex = nextIndex
+                    }
+                }
+            } else {
+                currentFrameIndex = (currentFrameIndex + 1) % loadedBitmaps.size
+            }
         }
     }
 
-    val activeDisplayBitmap = when (currentFrameIndex) {
-        0 -> bitmapA
-        else -> bitmapB
-    }
+    val activeDisplayBitmap = loadedBitmaps.getOrNull(currentFrameIndex)
+    var isExporting by remember { mutableStateOf(false) }
 
     Column(modifier = Modifier.fillMaxSize()) {
         // Player screen area
         Box(
             modifier = Modifier
-                .weight(1f)
+                .weight(1.2f)
                 .fillMaxWidth()
                 .background(Color.Black),
             contentAlignment = Alignment.Center
@@ -987,12 +1455,8 @@ fun WigglePlayerLayout(
                     .background(Color(0x990D0F12), RoundedCornerShape(8.dp))
                     .padding(horizontal = 8.dp, vertical = 4.dp)
             ) {
-                val frameLabel = when (currentFrameIndex) {
-                    0 -> "CAM A"
-                    else -> "CAM B"
-                }
                 Text(
-                    text = "$frameLabel",
+                    text = "LINSE ${currentFrameIndex + 1}/${loadedBitmaps.size}",
                     fontSize = 10.sp,
                     fontWeight = FontWeight.Bold,
                     color = Color(0xFF00FFCC)
@@ -1008,54 +1472,154 @@ fun WigglePlayerLayout(
                 .padding(16.dp)
                 .verticalScroll(rememberScrollState())
         ) {
-            // Title descriptor
+            Text(
+                "3D WIGGLE CONTROLLER",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color.White,
+                letterSpacing = 1.sp,
+                modifier = Modifier.padding(bottom = 12.dp)
+            )
+
+            // Loop Mode Switcher
             Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(bottom = 12.dp),
+                modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    "3D WIGGLE CONTROLLER",
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.White,
-                    letterSpacing = 1.sp
-                )
-                
-                Text(
-                    "SAVED TO GALLERY",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color(0xFF00FFCC)
-                )
+                Text("Loop-Modus", fontSize = 13.sp, color = Color.LightGray)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = { isPingPong = true },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (isPingPong) Color(0xFF00FFCC) else Color(0xFF232A38)
+                        ),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                        modifier = Modifier.height(32.dp),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text(
+                            "Ping-Pong",
+                            fontSize = 11.sp,
+                            color = if (isPingPong) Color.Black else Color.White,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    Button(
+                        onClick = { isPingPong = false },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (!isPingPong) Color(0xFF00FFCC) else Color(0xFF232A38)
+                        ),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                        modifier = Modifier.height(32.dp),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text(
+                            "Loop",
+                            fontSize = 11.sp,
+                            color = if (!isPingPong) Color.Black else Color.White,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
             }
 
-            Text(
-                "Mache mehr daraus mit KI!",
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color.White,
-                modifier = Modifier.padding(bottom = 8.dp)
-            )
-            Text(
-                capture.prompt,
-                fontSize = 12.sp,
-                color = Color.LightGray,
-                modifier = Modifier.padding(bottom = 8.dp)
-            )
-            Button(
-                onClick = {
-                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                    val clip = android.content.ClipData.newPlainText("KI Prompt", capture.prompt)
-                    clipboard.setPrimaryClip(clip)
-                    android.widget.Toast.makeText(context, "Prompt kopiert!", android.widget.Toast.LENGTH_SHORT).show()
-                },
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00FFCC)),
-                modifier = Modifier.fillMaxWidth()
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // Speed Control
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Text("Prompt für Gemini (KI) kopieren", color = Color.Black, fontWeight = FontWeight.Bold)
+                Text("Geschwindigkeit", fontSize = 13.sp, color = Color.LightGray)
+                Text("${delayTimeMs.toInt()} ms", fontSize = 13.sp, color = Color(0xFF00FFCC), fontWeight = FontWeight.Bold)
+            }
+            Slider(
+                value = delayTimeMs,
+                onValueChange = { delayTimeMs = it },
+                valueRange = 50f..800f,
+                modifier = Modifier.padding(bottom = 12.dp)
+            )
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            // Export Actions
+            if (isExporting) {
+                Box(
+                    modifier = Modifier.fillMaxWidth(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        CircularProgressIndicator(color = Color(0xFF00FFCC), modifier = Modifier.size(28.dp))
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text("Exportiere GIF...", fontSize = 11.sp, color = Color(0xFF00FFCC))
+                    }
+                }
+            } else {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Button(
+                        onClick = {
+                            isExporting = true
+                            coroutineScope.launch(kotlinx.coroutines.Dispatchers.Default) {
+                                try {
+                                    val exportFrames = mutableListOf<Bitmap>()
+                                    if (isPingPong && loadedBitmaps.size > 2) {
+                                        exportFrames.addAll(loadedBitmaps)
+                                        for (i in (loadedBitmaps.size - 2) downTo 1) {
+                                            exportFrames.add(loadedBitmaps[i])
+                                        }
+                                    } else {
+                                        exportFrames.addAll(loadedBitmaps)
+                                    }
+                                    
+                                    val gifBytes = com.example.util.GifEncoder.encode(exportFrames, delayTimeMs.toInt())
+                                    val savedUri = WiggleProcessor.saveGifToGallery(context, gifBytes, "Wiggle_${System.currentTimeMillis()}")
+                                    
+                                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                                        if (savedUri != null) {
+                                            Toast.makeText(context, "GIF in Galerie gespeichert!", Toast.LENGTH_LONG).show()
+                                        } else {
+                                            Toast.makeText(context, "Export fehlgeschlagen", Toast.LENGTH_SHORT).show()
+                                        }
+                                        isExporting = false
+                                    }
+                                } catch (e: Exception) {
+                                    Log.e("WiggleApp", "Failed exporting GIF", e)
+                                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                                        Toast.makeText(context, "Fehler beim Exportieren", Toast.LENGTH_SHORT).show()
+                                        isExporting = false
+                                    }
+                                }
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00FFCC)),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.Gif, contentDescription = "GIF", tint = Color.Black)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("GIF Exportieren", color = Color.Black, fontWeight = FontWeight.Bold)
+                    }
+
+                    Button(
+                        onClick = {
+                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                            val clip = android.content.ClipData.newPlainText("KI Prompt", capture.prompt)
+                            clipboard.setPrimaryClip(clip)
+                            Toast.makeText(context, "Prompt kopiert!", Toast.LENGTH_SHORT).show()
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF232A38)),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.ContentCopy, contentDescription = "Copy", tint = Color.White)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Prompt kopieren", color = Color.White)
+                    }
+                }
             }
         }
     }
@@ -1116,7 +1680,7 @@ fun HistoryItemCard(
     ) {
         // Thumbnail loading
         AsyncImage(
-            model = item.imageAPath,
+            model = item.getThumbnailFile(),
             contentDescription = "Wiggle capture",
             contentScale = ContentScale.Crop,
             modifier = Modifier.fillMaxSize()

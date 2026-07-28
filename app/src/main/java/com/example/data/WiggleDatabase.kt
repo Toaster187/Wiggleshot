@@ -5,7 +5,7 @@ import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
 
-@Database(entities = [WiggleCapture::class], version = 2, exportSchema = false)
+@Database(entities = [WiggleCapture::class], version = 3, exportSchema = false)
 abstract class WiggleDatabase : RoomDatabase() {
     abstract fun wiggleDao(): WiggleDao
 
