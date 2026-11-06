@@ -6,12 +6,16 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import android.os.Build
+import com.example.align.WiggleAligner
 import com.example.camera.CameraLensDetails
+import com.example.camera.CapturedFrame
 import com.example.camera.LensDiscovery
 import com.example.data.SettingsManager
 import com.example.data.WiggleCapture
 import com.example.data.WiggleRepository
-import com.example.util.VisualZoomMatcher
+import com.example.diagnostics.DiagnosticsExporter
+import com.example.diagnostics.HalProbeRunner
 import com.example.util.WiggleProcessor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -45,7 +49,17 @@ data class WiggleUiState(
     val isCalibrating: Boolean = false,
     val lensCount: Int = 2,
     val showSettings: Boolean = false,
-    val is4K: Boolean = true
+    val is4K: Boolean = true,
+    /** Secondary lenses are aligned automatically instead of using the manual zoom. */
+    val autoAlign: Boolean = true,
+    val colorMatch: Boolean = true,
+    val diagnosticsMode: Boolean = false,
+    /** Human readable result of the last alignment / calibration, shown on the camera screen. */
+    val alignmentInfo: String? = null,
+    /** One-shot message for a toast; cleared by [WiggleViewModel.consumeMessage]. */
+    val message: String? = null,
+    val diagnosticsBusy: Boolean = false,
+    val diagnosticsStatus: String? = null
 ) {
     fun zoomLimitsFor(lens: CameraLensDetails): Pair<Float, Float> =
         zoomLimitsMap[lens.id] ?: DEFAULT_ZOOM_LIMITS
@@ -55,6 +69,13 @@ data class WiggleUiState(
         val limits = zoomLimitsFor(lens)
         return (zoomMap[lens.id] ?: 1.0f).coerceIn(limits.first, limits.second)
     }
+
+    /**
+     * Zoom the camera should apply while capturing. With auto alignment the secondaries are
+     * captured with their full field of view; the aligner then crops them precisely.
+     */
+    fun captureZoomFor(lens: CameraLensDetails): Float =
+        if (autoAlign && lens.id != primaryLens?.id) 1.0f else zoomFor(lens)
 }
 
 class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
@@ -75,6 +96,7 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
     val uiState: StateFlow<WiggleUiState> = _uiState.asStateFlow()
 
     private var discoveryStarted = false
+    private var aligner: WiggleAligner? = null
 
     /**
      * Enumerates the device's lenses once and restores the saved lens selection. Guarded
@@ -95,6 +117,9 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
                 val savedLensCount = SettingsManager.getLensCount(context)
                 val savedZoomLimits = SettingsManager.getZoomLimits(context)
                 val savedIs4K = SettingsManager.getIs4K(context)
+                val savedAutoAlign = SettingsManager.getAutoAlign(context)
+                val savedColorMatch = SettingsManager.getColorMatch(context)
+                val savedDiagnostics = SettingsManager.getDiagnosticsMode(context)
 
                 val primary = lenses.firstOrNull { it.id == savedPrimaryId }
                     ?: lenses.firstOrNull { !it.isDefaultUltraWide && it.isPhysical }
@@ -121,6 +146,9 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
                         zoomLimitsMap = zoomLimits,
                         zoomMap = lenses.associate { it.id to 1.0f },
                         is4K = savedIs4K,
+                        autoAlign = savedAutoAlign,
+                        colorMatch = savedColorMatch,
+                        diagnosticsMode = savedDiagnostics,
                         concurrentPreviewSupported = discovery.concurrentPreviewSupported,
                         previewStateMessage = if (discovery.concurrentPreviewSupported) {
                             "Dual Cameras Active"
@@ -187,50 +215,110 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
         _uiState.update { it.copy(is4K = is4K) }
     }
 
-    suspend fun calculateVisualZoomMatch(
-        bmpA: Bitmap,
-        bmpB: Bitmap,
-        minZoom: Float,
-        maxZoom: Float
-    ): Float = withContext(Dispatchers.Default) {
-        VisualZoomMatcher.calculate(bmpA, bmpB, minZoom, maxZoom)
+    fun setAutoAlign(context: Context, value: Boolean) {
+        SettingsManager.saveAutoAlign(context, value)
+        _uiState.update { it.copy(autoAlign = value) }
     }
 
+    fun setColorMatch(context: Context, value: Boolean) {
+        SettingsManager.saveColorMatch(context, value)
+        _uiState.update { it.copy(colorMatch = value) }
+    }
+
+    fun setDiagnosticsMode(context: Context, value: Boolean) {
+        SettingsManager.saveDiagnosticsMode(context, value)
+        _uiState.update { it.copy(diagnosticsMode = value) }
+    }
+
+    fun consumeMessage() {
+        _uiState.update { it.copy(message = null) }
+    }
+
+    private fun aligner(context: Context): WiggleAligner =
+        aligner ?: WiggleAligner(context.applicationContext).also { aligner = it }
+
     /**
-     * Applies the calibration measurements. The median of the passes is used because, unlike
-     * the mean, it is robust against a single outlier pass (e.g. a frame captured before
-     * auto exposure had converged).
+     * Measures the current lens pair on [frames] and stores the result as calibration. The
+     * frames are only used for the measurement and recycled afterwards.
      */
-    fun applyCalibrationResults(results: Map<String, List<Float>>) {
-        _uiState.update { state ->
-            val zoomMap = state.zoomMap.toMutableMap()
-            var secondaryZoom = state.zoomB
-
-            for ((lensId, zooms) in results) {
-                if (zooms.isEmpty()) continue
-                val limits = state.zoomLimitsMap[lensId] ?: DEFAULT_ZOOM_LIMITS
-                val clamped = median(zooms).coerceIn(limits.first, limits.second)
-                zoomMap[lensId] = clamped
-                Log.d(TAG, "Calibrated lens $lensId to ${clamped}x (from $zooms)")
-                if (lensId == state.secondaryLens?.id) secondaryZoom = clamped
+    fun calibrate(context: Context, frames: List<CapturedFrame>) {
+        viewModelScope.launch(Dispatchers.Default) {
+            _uiState.update { it.copy(isCalibrating = true) }
+            try {
+                if (frames.size < 2) {
+                    _uiState.update { it.copy(message = "Kalibrierung braucht zwei Linsen") }
+                    return@launch
+                }
+                val reports = aligner(context).calibrate(frames)
+                if (_uiState.value.diagnosticsMode) {
+                    DiagnosticsExporter.saveCapture(context, frames, reports, DiagnosticsExporter.newFolder(context, "calibration"))
+                }
+                val ok = reports.all { it.source == WiggleAligner.Source.IMAGE }
+                val info = reports.joinToString("\n") { it.summary() }
+                if (!_uiState.value.autoAlign) {
+                    // Manual mode: the measured magnification becomes the secondary zoom.
+                    val state = _uiState.value
+                    val primaryZoom = state.primaryLens?.let(state::zoomFor) ?: 1f
+                    reports.filter { it.source == WiggleAligner.Source.IMAGE }.forEach { r ->
+                        val limits = state.zoomLimitsMap[r.lensId] ?: DEFAULT_ZOOM_LIMITS
+                        setZoomForLens(r.lensId, (r.equivalentZoom * primaryZoom).toFloat().coerceIn(limits.first, limits.second))
+                    }
+                }
+                _uiState.update {
+                    it.copy(
+                        isAutoZoomApplied = ok,
+                        alignmentInfo = info,
+                        message = if (ok) {
+                            "Kalibriert: $info"
+                        } else {
+                            "Kalibrierung unsicher (zu wenig Struktur?) – bitte auf eine detailreiche Szene richten"
+                        }
+                    )
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Calibration failed", e)
+                _uiState.update { it.copy(message = "Kalibrierung fehlgeschlagen") }
+            } finally {
+                frames.forEach { if (!it.bitmap.isRecycled) it.bitmap.recycle() }
+                _uiState.update { it.copy(isCalibrating = false) }
             }
-
-            state.copy(
-                zoomMap = zoomMap,
-                zoomB = secondaryZoom,
-                isAutoZoomApplied = true,
-                isCalibrating = false
-            )
         }
     }
 
-    private fun median(values: List<Float>): Float {
-        val sorted = values.sorted()
-        val middle = sorted.size / 2
-        return if (sorted.size % 2 == 1) {
-            sorted[middle]
-        } else {
-            (sorted[middle - 1] + sorted[middle]) / 2f
+    fun resetCalibration(context: Context) {
+        aligner(context).clearCalibration()
+        _uiState.update {
+            it.copy(isAutoZoomApplied = false, alignmentInfo = null, message = "Kalibrierung zurückgesetzt")
+        }
+    }
+
+    fun exportCameraInfo(context: Context) {
+        viewModelScope.launch(Dispatchers.IO) {
+            _uiState.update { it.copy(diagnosticsBusy = true, diagnosticsStatus = "Exportiere Kamera-Metadaten …") }
+            val path = runCatching { DiagnosticsExporter.exportCameraInfo(context) }.getOrNull()
+            val text = path?.let { "Gespeichert in $it" } ?: "Export fehlgeschlagen"
+            _uiState.update { it.copy(diagnosticsBusy = false, diagnosticsStatus = text, message = text) }
+        }
+    }
+
+    /** Runs the HAL zoom experiment (see [HalProbeRunner]). The camera screen must be closed. */
+    fun runHalProbe(context: Context) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            _uiState.update { it.copy(message = "HAL-Test benötigt Android 11+") }
+            return
+        }
+        if (_uiState.value.diagnosticsBusy) return
+        viewModelScope.launch {
+            _uiState.update { it.copy(diagnosticsBusy = true, diagnosticsStatus = "Starte HAL-Test …") }
+            val summary = try {
+                HalProbeRunner.run(context.applicationContext, _uiState.value.availableLenses) { progress ->
+                    _uiState.update { it.copy(diagnosticsStatus = progress) }
+                }.text
+            } catch (e: Exception) {
+                Log.e(TAG, "HAL probe failed", e)
+                "HAL-Test fehlgeschlagen: ${e.message}"
+            }
+            _uiState.update { it.copy(diagnosticsBusy = false, diagnosticsStatus = summary) }
         }
     }
 
@@ -336,37 +424,61 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
         }
     }
 
-    /** Persists the frames of one capture and opens it in the player. */
-    fun performMultiCapture(context: Context, bitmaps: List<Bitmap>) {
-        if (bitmaps.isEmpty()) {
-            Log.e(TAG, "No bitmaps supplied, nothing to save")
+    /**
+     * Aligns the raw frames of one capture, persists the result and opens it in the player.
+     * The frames' bitmaps are consumed.
+     */
+    fun processCapture(context: Context, frames: List<CapturedFrame>) {
+        if (frames.isEmpty()) {
+            Log.e(TAG, "No frames supplied, nothing to save")
             return
         }
 
         viewModelScope.launch(Dispatchers.Default) {
             _uiState.update { it.copy(isCapturing = true) }
             try {
-                val timestamp = System.currentTimeMillis()
-                val savedPaths = bitmaps.mapIndexedNotNull { index, bitmap ->
-                    val path = WiggleProcessor.saveToInternalFiles(context, bitmap, "cam_${index}_$timestamp.jpg")
-                    WiggleProcessor.saveToGallery(context, bitmap, "Wiggle_${timestamp}_Frame_$index")
-                    path?.takeIf { it.isNotEmpty() }
+                val state = _uiState.value
+                val output = aligner(context).process(
+                    frames = frames,
+                    zoomFor = state::zoomFor,
+                    settings = WiggleAligner.Settings(autoAlign = state.autoAlign, colorMatch = state.colorMatch)
+                )
+                if (state.diagnosticsMode) {
+                    DiagnosticsExporter.saveCapture(context, frames, output.reports)
                 }
-
-                if (savedPaths.isEmpty()) {
-                    Log.e(TAG, "Could not persist any frame of this capture")
-                    return@launch
-                }
-
-                val capture = WiggleCapture(imagePaths = savedPaths.joinToString(","), timestamp = timestamp)
-                val insertId = repository.insertCapture(capture)
-                _uiState.update { it.copy(selectedCapture = capture.copy(id = insertId)) }
+                val info = output.reports.joinToString("\n") { it.summary() }.ifEmpty { null }
+                _uiState.update { it.copy(alignmentInfo = info ?: it.alignmentInfo) }
+                saveFrames(context, output.frames)
+            } catch (e: OutOfMemoryError) {
+                Log.e(TAG, "Out of memory processing capture", e)
+                _uiState.update { it.copy(message = "Zu wenig Speicher – bitte HD-Modus verwenden") }
             } catch (e: Exception) {
-                Log.e(TAG, "Error saving capture", e)
+                Log.e(TAG, "Error processing capture", e)
+                _uiState.update { it.copy(message = "Verarbeitung fehlgeschlagen") }
             } finally {
                 _uiState.update { it.copy(isCapturing = false) }
             }
         }
+    }
+
+    private suspend fun saveFrames(context: Context, bitmaps: List<Bitmap>) {
+        val timestamp = System.currentTimeMillis()
+        val savedPaths = bitmaps.mapIndexedNotNull { index, bitmap ->
+            val path = WiggleProcessor.saveToInternalFiles(context, bitmap, "cam_${index}_$timestamp.jpg")
+            WiggleProcessor.saveToGallery(context, bitmap, "Wiggle_${timestamp}_Frame_$index")
+            path?.takeIf { it.isNotEmpty() }
+        }
+        bitmaps.forEach { it.recycle() }
+
+        if (savedPaths.isEmpty()) {
+            Log.e(TAG, "Could not persist any frame of this capture")
+            _uiState.update { it.copy(message = "Speichern fehlgeschlagen") }
+            return
+        }
+
+        val capture = WiggleCapture(imagePaths = savedPaths.joinToString(","), timestamp = timestamp)
+        val insertId = repository.insertCapture(capture)
+        _uiState.update { it.copy(selectedCapture = capture.copy(id = insertId)) }
     }
 }
 

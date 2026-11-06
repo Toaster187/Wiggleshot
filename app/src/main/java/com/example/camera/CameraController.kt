@@ -1,7 +1,6 @@
 package com.example.camera
 
 import android.content.Context
-import android.graphics.Bitmap
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
@@ -75,7 +74,6 @@ class CameraController(context: Context) {
 
         private const val PREVIEW_SETTLE_MS = 220L
         private const val SEQUENTIAL_SETTLE_MS = 140L
-        private const val CALIBRATION_PREVIEW_SIZE = 640
     }
 
     enum class Mode {
@@ -362,7 +360,8 @@ class CameraController(context: Context) {
 
     /** Releases every camera resource. Returns true if CameraX use cases were bound. */
     private fun teardown(): Boolean {
-        dualSession?.close()
+        // A dual session only ever exists on API 28+.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) dualSession?.close()
         dualSession = null
         dualSurfaces.forEach { runCatching { it.release() } }
         dualSurfaces = emptyList()
@@ -387,13 +386,17 @@ class CameraController(context: Context) {
     // ------------------------------------------------------------------ capturing
 
     /**
-     * Captures one wiggle and returns the frames in lens order.
+     * Captures one wiggle and returns the raw, not yet aligned frames in lens order.
+     *
+     * [zoomFor] is the zoom the camera should apply while capturing (only the CameraX paths
+     * can zoom optically; the Camera2 path always delivers the full field of view and the
+     * zoom is applied when the frames are aligned).
      *
      * Returns an empty list when the capture produced nothing, and null when the request was
      * ignored because another capture or a reconfiguration is running. The whole operation is
      * time boxed, so the shutter can never stay stuck.
      */
-    suspend fun capture(request: Request, zoomFor: (CameraLensDetails) -> Float): List<Bitmap>? {
+    suspend fun capture(request: Request, zoomFor: (CameraLensDetails) -> Float): List<CapturedFrame>? {
         if (!lock.tryLock()) {
             Log.d(TAG, "Capture ignored, camera busy")
             return null
@@ -421,61 +424,83 @@ class CameraController(context: Context) {
         }
     }
 
+    @Suppress("UNUSED_PARAMETER")
     private suspend fun captureDual(
         request: Request,
         zoomFor: (CameraLensDetails) -> Float
-    ): List<Bitmap>? {
+    ): List<CapturedFrame>? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
         val session = dualSession ?: return null
         val secondary = request.secondaries.singleOrNull() ?: return null
         val pair = session.capture() ?: run {
             Log.w(TAG, "Dual capture returned nothing, falling back")
             return null
         }
-        val rotation = session.sensorOrientation
+        val rotationA = session.sensorOrientationOf(request.primary.id)
+        val rotationB = session.sensorOrientationOf(secondary.id)
         val frames = withContext(Dispatchers.Default) {
             listOfNotNull(
-                CameraImages.fromJpeg(pair.first, rotation, zoomFor(request.primary)),
-                CameraImages.fromJpeg(pair.second, rotation, zoomFor(secondary))
+                CameraImages.fromJpeg(pair.jpegA, rotationA)?.let {
+                    CapturedFrame(request.primary, it, rotationA, 1f, pair.metadataA, pair.jpegA)
+                },
+                CameraImages.fromJpeg(pair.jpegB, rotationB)?.let {
+                    CapturedFrame(secondary, it, rotationB, 1f, pair.metadataB, pair.jpegB)
+                }
             )
         }
-        return frames.takeIf { it.size == 2 }
+        return frames.takeIf { it.size == 2 } ?: run {
+            frames.forEach { it.bitmap.recycle() }
+            null
+        }
     }
 
     private suspend fun capturePair(
         request: Request,
         zoomFor: (CameraLensDetails) -> Float
-    ): List<Bitmap>? {
+    ): List<CapturedFrame>? {
         val a = captureA ?: return null
         val b = captureB ?: return null
         val secondary = request.secondaries.singleOrNull() ?: return null
 
-        applyZoom(zoomFor(request.primary), zoomFor(secondary))
+        val zoomA = zoomFor(request.primary)
+        val zoomB = zoomFor(secondary)
+        applyZoom(zoomA, zoomB)
 
-        val frames = coroutineScope {
+        val decoded = coroutineScope {
             listOf(
-                async { a.captureBitmap(imageExecutor) },
-                async { b.captureBitmap(imageExecutor) }
+                async { a.captureDecoded(imageExecutor) },
+                async { b.captureDecoded(imageExecutor) }
             ).awaitAll()
         }
-        return frames.filterNotNull().takeIf { it.size == 2 }
+        val first = decoded[0]
+        val second = decoded[1]
+        if (first == null || second == null) {
+            first?.bitmap?.recycle()
+            second?.bitmap?.recycle()
+            return null
+        }
+        return listOf(
+            CapturedFrame(request.primary, first.bitmap, first.rotationDegrees, zoomA, null, first.jpeg),
+            CapturedFrame(secondary, second.bitmap, second.rotationDegrees, zoomB, null, second.jpeg)
+        )
     }
 
     private suspend fun captureSequential(
         request: Request,
         zoomFor: (CameraLensDetails) -> Float
-    ): List<Bitmap> {
+    ): List<CapturedFrame> {
         runCountdown()
 
-        val frames = mutableListOf<Bitmap>()
+        val frames = mutableListOf<CapturedFrame>()
         request.lenses.forEachIndexed { index, lens ->
             val zoom = zoomFor(lens)
-            val bitmap = if (index == 0) {
+            val decoded = if (index == 0) {
                 captureFromLiveCamera(lens, zoom) ?: captureStillFrame(lens, zoom, request.is4K, PREVIEW_SETTLE_MS)
             } else {
                 captureStillFrame(lens, zoom, request.is4K, SEQUENTIAL_SETTLE_MS)
             }
-            if (bitmap != null) {
-                frames += bitmap
+            if (decoded != null) {
+                frames += CapturedFrame(lens, decoded.bitmap, decoded.rotationDegrees, zoom, null, decoded.jpeg)
             } else {
                 Log.e(TAG, "No frame captured for lens ${lens.id}")
             }
@@ -484,24 +509,23 @@ class CameraController(context: Context) {
     }
 
     /** Fast path: the primary lens is already streaming, so no rebind is needed. */
-    private suspend fun captureFromLiveCamera(lens: CameraLensDetails, zoom: Float): Bitmap? {
+    private suspend fun captureFromLiveCamera(lens: CameraLensDetails, zoom: Float): CameraImages.Decoded? {
         val imageCapture = captureA ?: return null
         if (request?.primary?.id != lens.id) return null
         runCatching { controlA?.setZoomRatio(zoom)?.awaitResult() }
-        return imageCapture.captureBitmap(imageExecutor)
+        return imageCapture.captureDecoded(imageExecutor)
     }
 
     /**
      * Binds [lens] on its own, waits for auto exposure and white balance to settle and takes
-     * a single frame. Used for the second and further lenses of a sequential capture and for
-     * calibration.
+     * a single frame. Used for the second and further lenses of a sequential capture.
      */
     private suspend fun captureStillFrame(
         lens: CameraLensDetails,
         zoom: Float,
         is4K: Boolean,
         settleDelayMs: Long
-    ): Bitmap? {
+    ): CameraImages.Decoded? {
         val owner = lifecycleOwner ?: return null
         val views = views ?: return null
         val provider = obtainProvider() ?: return null
@@ -531,7 +555,7 @@ class CameraController(context: Context) {
                 Log.w(TAG, "3A did not converge for lens ${lens.id}, capturing anyway")
             }
             delay(settleDelayMs)
-            imageCapture.captureBitmap(imageExecutor)
+            imageCapture.captureDecoded(imageExecutor)
         } catch (e: Exception) {
             Log.e(TAG, "Still frame capture failed for lens ${lens.id}", e)
             null
@@ -547,46 +571,8 @@ class CameraController(context: Context) {
         delay(180)
     }
 
-    // ---------------------------------------------------------------- calibration
-
-    /**
-     * Grabs one comparison pair for the auto zoom calibration, using whichever source the
-     * current mode provides. Returns null when no usable frames are available.
-     */
-    suspend fun calibrationFrames(
-        primary: CameraLensDetails,
-        primaryZoom: Float,
-        secondary: CameraLensDetails,
-        secondaryZoom: Float,
-        is4K: Boolean
-    ): Pair<Bitmap, Bitmap>? {
-        val views = views ?: return null
-        val pair = when (_status.value.mode) {
-            Mode.DUAL_PHYSICAL -> {
-                views.textureA.bitmapOrNull() to views.textureB.bitmapOrNull()
-            }
-
-            Mode.CAMERAX_PAIR -> {
-                views.previewA.bitmap to views.previewB.bitmap
-            }
-
-            else -> lock.withLock {
-                captureStillFrame(primary, primaryZoom, is4K, PREVIEW_SETTLE_MS) to
-                    captureStillFrame(secondary, secondaryZoom, is4K, PREVIEW_SETTLE_MS)
-            }
-        }
-
-        val first = pair.first ?: return null
-        val second = pair.second ?: return null
-        if (first.width < 50 || first.height < 50 || second.width < 50 || second.height < 50) return null
-        return first to second
-    }
-
-    /** Rebuilds the live preview after calibration destroyed the bindings. */
+    /** Rebuilds the live preview, e.g. after a sequential capture unbound it. */
     fun requestReconfigure() {
         reconfigureRequests.tryEmit(Unit)
     }
-
-    private fun ZoomableTextureView.bitmapOrNull(): Bitmap? =
-        if (isAvailable) getBitmap(CALIBRATION_PREVIEW_SIZE, CALIBRATION_PREVIEW_SIZE * 3 / 4) else null
 }

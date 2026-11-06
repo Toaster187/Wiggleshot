@@ -20,7 +20,7 @@ abstract class WiggleDatabase : RoomDatabase() {
                     WiggleDatabase::class.java,
                     "wiggle_database"
                 )
-                .fallbackToDestructiveMigration()
+                .fallbackToDestructiveMigration(dropAllTables = true)
                 .build()
                 INSTANCE = instance
                 instance

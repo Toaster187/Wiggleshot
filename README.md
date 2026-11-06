@@ -10,6 +10,11 @@ Wiggleshot is an Android app that lets you add animated wiggle effects to your p
 - Gemini AI integration for depth estimation
 - Clean Material 3 UI built with Jetpack Compose
 - CameraX support for in-app capture
+- Simultaneous dual-lens capture (e.g. Pixel 9: 1x + 0.5x) with automatic lens matching:
+  scale, rotation, offset and colour of the 0.5x lens are measured on every shot so it lines
+  up with the 1x lens — see [docs/LENS_MATCHING.md](./docs/LENS_MATCHING.md)
+- Diagnostics: raw frame / metadata export and a HAL zoom test that compares the matching
+  with the one the Pixel camera pipeline uses itself
 
 ## Getting Started
 
@@ -21,6 +26,8 @@ Wiggleshot is an Android app that lets you add animated wiggle effects to your p
 4. Create a file named `.env` in the project directory and set `GEMINI_API_KEY` to your Gemini API key (see `.env.example` for an example)
 5. Remove this line from the app's `build.gradle.kts` file: `signingConfig = signingConfigs.getByName("debugConfig")`
 6. Run the app on an emulator or physical device
+
+Unit tests (including the lens alignment accuracy tests): `./gradlew testDebugUnitTest`
 
 ## License
 

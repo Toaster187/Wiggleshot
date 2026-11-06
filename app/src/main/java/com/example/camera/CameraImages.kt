@@ -11,15 +11,18 @@ import androidx.camera.core.ImageProxy
  *
  * Every function returns null instead of throwing: a single decode failure must never
  * take down a capture, it only reduces the number of frames in the resulting wiggle.
+ *
+ * Frames are deliberately **not** zoomed or cropped here any more. The old code centre
+ * cropped each lens by its zoom factor right after decoding, which threw away the area the
+ * aligner needs to correct the real (off-centre) optical axis of the secondary lens.
  */
 internal object CameraImages {
     private const val TAG = "CameraImages"
 
-    /**
-     * Decodes a JPEG [ImageProxy], applies its crop rect and rotation and scales the crop
-     * back to the original frame size so that all frames of one capture share dimensions.
-     */
-    fun fromImageProxy(image: ImageProxy): Bitmap? = try {
+    class Decoded(val bitmap: Bitmap, val rotationDegrees: Int, val jpeg: ByteArray?)
+
+    /** Decodes a JPEG [ImageProxy], applies its crop rect (without stretching) and rotation. */
+    fun fromImageProxy(image: ImageProxy): Decoded? = try {
         val buffer = image.planes[0].buffer
         val bytes = ByteArray(buffer.remaining())
         buffer.get(bytes)
@@ -30,20 +33,14 @@ internal object CameraImages {
             val crop = image.cropRect
             val scaleX = decoded.width.toFloat() / image.width.toFloat()
             val scaleY = decoded.height.toFloat() / image.height.toFloat()
-
             val cropWidth = (crop.width() * scaleX).toInt().coerceIn(1, decoded.width)
             val cropHeight = (crop.height() * scaleY).toInt().coerceIn(1, decoded.height)
             val cropX = (crop.left * scaleX).toInt().coerceIn(0, decoded.width - cropWidth)
             val cropY = (crop.top * scaleY).toInt().coerceIn(0, decoded.height - cropHeight)
-
-            val matrix = Matrix().apply {
-                postRotate(image.imageInfo.rotationDegrees.toFloat())
-                postScale(
-                    decoded.width.toFloat() / cropWidth,
-                    decoded.height.toFloat() / cropHeight
-                )
-            }
+            val rotation = image.imageInfo.rotationDegrees
+            val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
             createBitmapSafely(decoded, cropX, cropY, cropWidth, cropHeight, matrix)
+                ?.let { Decoded(it, rotation, bytes) }
         }
     } catch (e: Exception) {
         Log.e(TAG, "Failed converting ImageProxy", e)
@@ -53,26 +50,14 @@ internal object CameraImages {
         null
     }
 
-    /**
-     * Decodes a raw JPEG from the Camera2 path, centre-crops it by [zoom] and rotates it
-     * upright. The crop is scaled back up so frames captured with different zoom factors
-     * still line up pixel for pixel.
-     */
-    fun fromJpeg(bytes: ByteArray, rotationDegrees: Int, zoom: Float): Bitmap? = try {
+    /** Decodes a raw JPEG from the Camera2 path and rotates it upright. */
+    fun fromJpeg(bytes: ByteArray, rotationDegrees: Int): Bitmap? = try {
         val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
         if (decoded == null) {
             null
         } else {
-            val safeZoom = if (zoom.isFinite()) zoom.coerceAtLeast(1f) else 1f
-            val cropWidth = (decoded.width / safeZoom).toInt().coerceIn(1, decoded.width)
-            val cropHeight = (decoded.height / safeZoom).toInt().coerceIn(1, decoded.height)
-            val cropX = (decoded.width - cropWidth) / 2
-            val cropY = (decoded.height - cropHeight) / 2
-            val matrix = Matrix().apply {
-                postRotate(rotationDegrees.toFloat())
-                postScale(safeZoom, safeZoom)
-            }
-            createBitmapSafely(decoded, cropX, cropY, cropWidth, cropHeight, matrix)
+            val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
+            createBitmapSafely(decoded, 0, 0, decoded.width, decoded.height, matrix)
         }
     } catch (e: Exception) {
         Log.e(TAG, "Failed decoding JPEG", e)

@@ -1,7 +1,6 @@
 package com.example.camera
 
 import android.content.Context
-import android.graphics.Bitmap
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
@@ -11,6 +10,7 @@ import android.util.Log
 import android.util.Size
 import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.AspectRatio
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCapture
@@ -78,6 +78,7 @@ internal fun previewResolutionSelector(): ResolutionSelector =
  * Resolves the [CameraSelector] that opens exactly [cameraId]. Falls back to the default
  * back camera when the id is unknown, so binding never fails outright.
  */
+@androidx.annotation.OptIn(markerClass = [ExperimentalCamera2Interop::class])
 internal fun findCameraSelector(provider: ProcessCameraProvider, cameraId: String): CameraSelector {
     for (info in provider.availableCameraInfos) {
         val id = runCatching { Camera2CameraInfo.from(info).cameraId }.getOrNull()
@@ -91,6 +92,7 @@ internal fun findCameraSelector(provider: ProcessCameraProvider, cameraId: Strin
     return CameraSelector.DEFAULT_BACK_CAMERA
 }
 
+@androidx.annotation.OptIn(markerClass = [ExperimentalCamera2Interop::class])
 internal fun imageCaptureFor(lens: CameraLensDetails, is4K: Boolean): ImageCapture {
     val builder = ImageCapture.Builder()
         .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
@@ -107,6 +109,7 @@ internal fun imageCaptureFor(lens: CameraLensDetails, is4K: Boolean): ImageCaptu
  * capturing before that yields frames with unpredictable brightness, which makes the
  * calibration match non-deterministic across app starts.
  */
+@androidx.annotation.OptIn(markerClass = [ExperimentalCamera2Interop::class])
 internal fun previewFor(
     lens: CameraLensDetails,
     convergence: CompletableDeferred<Unit>? = null
@@ -152,12 +155,12 @@ internal fun previewFor(
  * Takes a single picture. Returns null instead of throwing so a failing lens degrades the
  * capture to fewer frames rather than aborting it.
  */
-internal suspend fun ImageCapture.captureBitmap(executor: Executor): Bitmap? =
+internal suspend fun ImageCapture.captureDecoded(executor: Executor): CameraImages.Decoded? =
     suspendCancellableCoroutine { continuation ->
         try {
             takePicture(executor, object : ImageCapture.OnImageCapturedCallback() {
                 override fun onCaptureSuccess(image: ImageProxy) {
-                    val bitmap = try {
+                    val decoded = try {
                         CameraImages.fromImageProxy(image)
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed converting captured image", e)
@@ -165,7 +168,7 @@ internal suspend fun ImageCapture.captureBitmap(executor: Executor): Bitmap? =
                     } finally {
                         runCatching { image.close() }
                     }
-                    if (continuation.isActive) continuation.resume(bitmap)
+                    if (continuation.isActive) continuation.resume(decoded)
                 }
 
                 override fun onError(exception: ImageCaptureException) {

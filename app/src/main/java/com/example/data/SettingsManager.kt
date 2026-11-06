@@ -10,6 +10,9 @@ object SettingsManager {
     private const val KEY_SECONDARY_LENS_IDS = "secondary_lens_ids"
     private const val KEY_ZOOM_LIMITS = "zoom_limits" // Format: lensId:min:max,lensId:min:max
     private const val KEY_IS_4K = "is_4k"
+    private const val KEY_AUTO_ALIGN = "auto_align"
+    private const val KEY_COLOR_MATCH = "color_match"
+    private const val KEY_DIAGNOSTICS = "diagnostics_mode"
 
     private const val TAG = "SettingsManager"
 
@@ -22,6 +25,23 @@ object SettingsManager {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs.edit().putBoolean(KEY_IS_4K, is4K).apply()
     }
+
+    /** Align secondary lenses automatically (scale, rotation, offset) instead of manual zoom. */
+    fun getAutoAlign(context: Context): Boolean = prefs(context).getBoolean(KEY_AUTO_ALIGN, true)
+
+    fun saveAutoAlign(context: Context, value: Boolean) = prefs(context).edit().putBoolean(KEY_AUTO_ALIGN, value).apply()
+
+    fun getColorMatch(context: Context): Boolean = prefs(context).getBoolean(KEY_COLOR_MATCH, true)
+
+    fun saveColorMatch(context: Context, value: Boolean) = prefs(context).edit().putBoolean(KEY_COLOR_MATCH, value).apply()
+
+    /** Save raw frames, metadata and alignment reports of every capture to Downloads. */
+    fun getDiagnosticsMode(context: Context): Boolean = prefs(context).getBoolean(KEY_DIAGNOSTICS, false)
+
+    fun saveDiagnosticsMode(context: Context, value: Boolean) =
+        prefs(context).edit().putBoolean(KEY_DIAGNOSTICS, value).apply()
+
+    private fun prefs(context: Context) = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     fun getLensCount(context: Context): Int {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)

@@ -9,6 +9,8 @@ import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.media.ImageReader
@@ -19,6 +21,7 @@ import android.util.Log
 import android.util.Size
 import android.view.Surface
 import androidx.annotation.RequiresApi
+import com.example.align.FrameMetadata
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
@@ -48,6 +51,7 @@ class DualPhysicalSession(
         private const val TAG = "DualPhysicalSession"
         const val OPEN_TIMEOUT_MS = 4_000L
         const val CAPTURE_TIMEOUT_MS = 4_000L
+        const val RESULT_GRACE_MS = 500L
     }
 
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -292,17 +296,34 @@ class DualPhysicalSession(
         false
     }
 
+    /** One synchronised still capture: both JPEGs plus the capture result of each lens. */
+    class DualCapture(
+        val jpegA: ByteArray,
+        val jpegB: ByteArray,
+        val metadataA: FrameMetadata?,
+        val metadataB: FrameMetadata?
+    )
+
+    /** Sensor orientation of a physical camera, falling back to the logical one. */
+    fun sensorOrientationOf(physicalId: String?): Int {
+        if (physicalId == null) return sensorOrientation
+        return runCatching {
+            cameraManager.getCameraCharacteristics(physicalId).get(CameraCharacteristics.SENSOR_ORIENTATION)
+        }.getOrNull() ?: sensorOrientation
+    }
+
     /**
      * Triggers one synchronised still capture. Returns null on failure or timeout; it never
      * suspends indefinitely.
      */
-    suspend fun capture(): Pair<ByteArray, ByteArray>? {
+    suspend fun capture(): DualCapture? {
         if (closed) return null
         val camera = device ?: return null
         val captureSession = session ?: return null
 
         val request = PendingCapture()
         pending = request
+        val result = CompletableDeferred<TotalCaptureResult?>()
         try {
             val builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                 addTarget(readerA.surface)
@@ -316,12 +337,21 @@ class DualPhysicalSession(
             captureSession.capture(
                 builder.build(),
                 object : CameraCaptureSession.CaptureCallback() {
+                    override fun onCaptureCompleted(
+                        s: CameraCaptureSession,
+                        r: CaptureRequest,
+                        total: TotalCaptureResult
+                    ) {
+                        result.complete(total)
+                    }
+
                     override fun onCaptureFailed(
                         s: CameraCaptureSession,
                         r: CaptureRequest,
                         failure: CaptureFailure
                     ) {
                         Log.e(TAG, "Still capture failed, reason ${failure.reason}")
+                        result.complete(null)
                         request.a.completeExceptionally(IllegalStateException("capture failed"))
                         request.b.completeExceptionally(IllegalStateException("capture failed"))
                     }
@@ -332,7 +362,9 @@ class DualPhysicalSession(
             return withTimeoutOrNull(CAPTURE_TIMEOUT_MS) {
                 val a = request.a.await()
                 val b = request.b.await()
-                a to b
+                // The result normally arrives before the JPEGs; never wait long for it.
+                val total = withTimeoutOrNull(RESULT_GRACE_MS) { result.await() }
+                DualCapture(a, b, total?.let { metadataFor(it, physicalIdA) }, total?.let { metadataFor(it, physicalIdB) })
             }
         } catch (e: Exception) {
             Log.e(TAG, "Still capture threw", e)
@@ -341,6 +373,19 @@ class DualPhysicalSession(
             pending = null
         }
     }
+
+    private fun metadataFor(total: TotalCaptureResult, physicalId: String?): FrameMetadata? = runCatching {
+        if (physicalId == null || physicalId == logicalCameraId) {
+            return@runCatching LensMetadata.fromResult(logicalCameraId, total)
+        }
+        val physical: CaptureResult? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            total.physicalCameraTotalResults[physicalId]
+        } else {
+            @Suppress("DEPRECATION")
+            total.physicalCameraResults[physicalId]
+        }
+        physical?.let { LensMetadata.fromResult(physicalId, it) }
+    }.onFailure { Log.w(TAG, "No physical result for $physicalId", it) }.getOrNull()
 
     fun close() {
         if (closed) return

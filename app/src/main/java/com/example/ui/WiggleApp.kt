@@ -1,6 +1,7 @@
 package com.example.ui
 
 import android.Manifest
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -61,6 +62,13 @@ fun WiggleApp(viewModel: WiggleViewModel) {
 
     LaunchedEffect(permissionGranted) {
         if (permissionGranted) viewModel.initCameraDiscovery(context)
+    }
+
+    LaunchedEffect(uiState.message) {
+        uiState.message?.let {
+            Toast.makeText(context, it, Toast.LENGTH_LONG).show()
+            viewModel.consumeMessage()
+        }
     }
 
     Scaffold(

@@ -47,15 +47,8 @@ import com.example.camera.CameraController
 import com.example.camera.CameraLensDetails
 import com.example.camera.ZoomableTextureView
 import com.example.ui.theme.WiggleColors
-import kotlinx.coroutines.TimeoutCancellationException
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeout
 import java.util.Locale
-
-private const val CALIBRATION_PASSES = 3
-private const val CALIBRATION_TIMEOUT_MS = 15_000L
-private const val CALIBRATION_PASS_DELAY_MS = 120L
 
 /**
  * Live camera screen: viewfinder, zoom controls, calibration and shutter.
@@ -122,8 +115,10 @@ fun CameraScreen(
         }
     }
 
-    LaunchedEffect(uiState.zoomA, uiState.zoomB, status.mode) {
-        controller.applyZoom(uiState.zoomA, uiState.zoomB)
+    // With auto alignment the secondary lens always streams its full field of view.
+    val secondaryPreviewZoom = if (uiState.autoAlign) 1f else uiState.zoomB
+    LaunchedEffect(uiState.zoomA, secondaryPreviewZoom, status.mode) {
+        controller.applyZoom(uiState.zoomA, secondaryPreviewZoom)
     }
 
     fun startCapture() {
@@ -134,13 +129,15 @@ fun CameraScreen(
         scope.launch {
             // null means the request was ignored because a capture is already running.
             val frames = controller.capture(activeRequest) { lens ->
-                viewModel.uiState.value.zoomFor(lens)
+                viewModel.uiState.value.captureZoomFor(lens)
             } ?: return@launch
 
             when {
-                frames.size >= 2 -> viewModel.performMultiCapture(context, frames)
-                frames.size == 1 ->
+                frames.size >= 2 -> viewModel.processCapture(context, frames)
+                frames.size == 1 -> {
+                    frames.forEach { it.bitmap.recycle() }
                     Toast.makeText(context, "Nur ein Frame erfasst – Aufnahme verworfen", Toast.LENGTH_SHORT).show()
+                }
                 else ->
                     Toast.makeText(context, "Aufnahme fehlgeschlagen", Toast.LENGTH_SHORT).show()
             }
@@ -168,7 +165,16 @@ fun CameraScreen(
             uiState = uiState,
             viewModel = viewModel,
             onCalibrate = {
-                scope.launch { runCalibration(context, controller, viewModel) }
+                val activeRequest = request
+                if (activeRequest == null || activeRequest.secondaries.isEmpty()) {
+                    Toast.makeText(context, "Keine Linsen zum Kalibrieren", Toast.LENGTH_SHORT).show()
+                } else {
+                    scope.launch {
+                        runCalibration(context, controller, activeRequest, viewModel)
+                        // A CameraX capture may have reset the optical zoom of the preview.
+                        controller.applyZoom(uiState.zoomA, secondaryPreviewZoom)
+                    }
+                }
             },
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -313,14 +319,18 @@ private fun ZoomPanel(
             )
         }
 
-        uiState.secondaryLenses.forEachIndexed { index, lens ->
-            LensZoomSlider(
-                label = "ZOOM (SEKUNDÄRLINSE ${index + 1})",
-                labelColor = WiggleColors.TextPrimary,
-                lens = lens,
-                uiState = uiState,
-                onZoomChange = { viewModel.setZoomForLens(lens.id, it) }
-            )
+        if (uiState.autoAlign) {
+            AutoAlignInfo(uiState.alignmentInfo)
+        } else {
+            uiState.secondaryLenses.forEachIndexed { index, lens ->
+                LensZoomSlider(
+                    label = "ZOOM (SEKUNDÄRLINSE ${index + 1})",
+                    labelColor = WiggleColors.TextPrimary,
+                    lens = lens,
+                    uiState = uiState,
+                    onZoomChange = { viewModel.setZoomForLens(lens.id, it) }
+                )
+            }
         }
 
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
@@ -330,6 +340,23 @@ private fun ZoomPanel(
                 onClick = onCalibrate
             )
         }
+    }
+}
+
+@Composable
+private fun AutoAlignInfo(info: String?) {
+    Column {
+        Text(
+            text = "SEKUNDÄRLINSE: AUTO-AUSRICHTUNG",
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Bold,
+            color = WiggleColors.TextPrimary
+        )
+        Text(
+            text = info ?: "Skalierung, Rotation, Versatz und Farbe werden bei jeder Aufnahme gemessen",
+            fontSize = 9.sp,
+            color = WiggleColors.TextTertiary
+        )
     }
 }
 
@@ -401,8 +428,8 @@ private fun CalibrationButton(isCalibrating: Boolean, isApplied: Boolean, onClic
             Text(
                 text = when {
                     isCalibrating -> "KALIBRIERE..."
-                    isApplied -> "✓ AUTO"
-                    else -> "⚡ AUTO KALIBRIERUNG"
+                    isApplied -> "✓ KALIBRIERT"
+                    else -> "⚡ LINSEN KALIBRIEREN"
                 },
                 fontSize = 10.sp,
                 fontWeight = FontWeight.Black,
@@ -454,62 +481,36 @@ private fun ShutterBar(busy: Boolean, onCapture: () -> Unit, modifier: Modifier 
 }
 
 /**
- * Measures the zoom factor at which each secondary lens visually matches the primary lens.
+ * Takes one real capture with every lens at its full field of view and lets the view model
+ * measure and store the lens pair calibration from it.
  *
- * Runs entirely against [CameraController.calibrationFrames], which knows how to obtain a
- * comparison pair in every mode. The previous version reached into preview views, texture
- * views and lens selection state from inside the composable and temporarily rebound the
- * secondary lens, which left the camera in an inconsistent state whenever it was cancelled.
+ * The previous calibration compared tiny preview frames (640 px) and only searched a zoom
+ * factor; it now uses the same full resolution stills and the same aligner as every capture.
  */
 private suspend fun runCalibration(
     context: Context,
     controller: CameraController,
+    request: CameraController.Request,
     viewModel: WiggleViewModel
 ) {
-    val state = viewModel.uiState.value
-    val primary = state.primaryLens
-    if (primary == null || state.secondaryLenses.isEmpty()) {
-        Toast.makeText(context, "Keine Linsen zum Kalibrieren", Toast.LENGTH_SHORT).show()
-        return
-    }
-
+    if (viewModel.uiState.value.isCalibrating) return
     viewModel.setCalibrating(true)
-    val results = mutableMapOf<String, MutableList<Float>>()
-    try {
-        withTimeout(CALIBRATION_TIMEOUT_MS) {
-            for (lens in state.secondaryLenses) {
-                val limits = state.zoomLimitsFor(lens)
-                val minZoom = limits.first.coerceAtLeast(1.0f)
-                repeat(CALIBRATION_PASSES) { pass ->
-                    val frames = controller.calibrationFrames(
-                        primary = primary,
-                        primaryZoom = state.zoomFor(primary),
-                        secondary = lens,
-                        secondaryZoom = minZoom,
-                        is4K = state.is4K
-                    )
-                    if (frames == null) {
-                        android.util.Log.w("CameraScreen", "No calibration frames for lens ${lens.id}")
-                    } else {
-                        results.getOrPut(lens.id) { mutableListOf() } +=
-                            viewModel.calculateVisualZoomMatch(frames.first, frames.second, minZoom, limits.second)
-                    }
-                    if (pass < CALIBRATION_PASSES - 1) delay(CALIBRATION_PASS_DELAY_MS)
-                }
-            }
-        }
-        if (results.values.all { it.isEmpty() }) {
-            Toast.makeText(context, "Kalibrierung fehlgeschlagen – Kamera nicht bereit", Toast.LENGTH_SHORT).show()
-        } else {
-            viewModel.applyCalibrationResults(results)
-        }
-    } catch (e: TimeoutCancellationException) {
-        Toast.makeText(context, "Kalibrierung Timeout", Toast.LENGTH_SHORT).show()
+    val frames = try {
+        controller.capture(request) { 1.0f }
     } catch (e: Exception) {
-        android.util.Log.e("CameraScreen", "Calibration failed", e)
-        Toast.makeText(context, "Kalibrierung fehlgeschlagen", Toast.LENGTH_SHORT).show()
-    } finally {
-        viewModel.setCalibrating(false)
-        controller.requestReconfigure()
+        android.util.Log.e("CameraScreen", "Calibration capture failed", e)
+        null
+    }
+    when {
+        frames == null -> {
+            viewModel.setCalibrating(false)
+            Toast.makeText(context, "Kamera beschäftigt – bitte erneut versuchen", Toast.LENGTH_SHORT).show()
+        }
+        frames.size < 2 -> {
+            frames.forEach { it.bitmap.recycle() }
+            viewModel.setCalibrating(false)
+            Toast.makeText(context, "Kalibrierung fehlgeschlagen – Kamera nicht bereit", Toast.LENGTH_SHORT).show()
+        }
+        else -> viewModel.calibrate(context, frames)
     }
 }

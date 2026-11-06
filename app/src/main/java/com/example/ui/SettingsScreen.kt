@@ -13,6 +13,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -58,7 +59,7 @@ fun SettingsScreen(
                     .size(44.dp)
             ) {
                 Icon(
-                    imageVector = Icons.Default.ArrowBack,
+                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                     contentDescription = "Back",
                     tint = Color.White
                 )
@@ -413,6 +414,10 @@ fun SettingsScreen(
 
         Spacer(modifier = Modifier.height(24.dp))
 
+        AlignmentSection(viewModel = viewModel, uiState = uiState)
+
+        Spacer(modifier = Modifier.height(24.dp))
+
         // 5. Zoom-Limits pro Linse (Akkordeon)
         Text(
             text = "INDIVIDUELLE ZOOM-LIMITS",
@@ -452,7 +457,7 @@ fun SettingsScreen(
                             color = Color.White
                         )
                         Text(
-                            text = "Bereich: ${String.format("%.1fx", limits.first)} - ${String.format("%.1fx", limits.second)}",
+                            text = "Bereich: ${String.format(java.util.Locale.US, "%.1fx", limits.first)} - ${String.format(java.util.Locale.US, "%.1fx", limits.second)}",
                             fontSize = 12.sp,
                             color = Color(0xFF00FFCC),
                             fontWeight = FontWeight.SemiBold
@@ -489,7 +494,7 @@ fun SettingsScreen(
                                 color = Color.Gray
                             )
                             Text(
-                                text = String.format("%.1fx", limits.first),
+                                text = String.format(java.util.Locale.US, "%.1fx", limits.first),
                                 fontSize = 12.sp,
                                 color = Color.White,
                                 fontWeight = FontWeight.Bold
@@ -517,7 +522,7 @@ fun SettingsScreen(
                                 color = Color.Gray
                             )
                             Text(
-                                text = String.format("%.1fx", limits.second),
+                                text = String.format(java.util.Locale.US, "%.1fx", limits.second),
                                 fontSize = 12.sp,
                                 color = Color.White,
                                 fontWeight = FontWeight.Bold
@@ -538,5 +543,140 @@ fun SettingsScreen(
         }
 
         Spacer(modifier = Modifier.height(40.dp))
+    }
+}
+
+@Composable
+private fun AlignmentSection(viewModel: WiggleViewModel, uiState: WiggleUiState) {
+    val context = LocalContext.current
+    Text(
+        text = "LINSEN-AUSRICHTUNG",
+        fontSize = 12.sp,
+        fontWeight = FontWeight.Bold,
+        color = Color(0xFF4E586E),
+        letterSpacing = 1.sp,
+        fontFamily = FontFamily.Monospace,
+        modifier = Modifier.padding(bottom = 10.dp)
+    )
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Color(0xFF161920), RoundedCornerShape(16.dp))
+            .border(1.dp, Color(0xFF232A38), RoundedCornerShape(16.dp))
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        SettingSwitch(
+            title = "Automatische Ausrichtung",
+            subtitle = "Misst bei jeder Aufnahme Skalierung, Rotation und Versatz der Zweitlinse " +
+                "(z. B. 0,5× → 1×) und richtet die Bildmitte als Drehpunkt aus.",
+            checked = uiState.autoAlign,
+            onChange = { viewModel.setAutoAlign(context, it) }
+        )
+        SettingSwitch(
+            title = "Farbabgleich",
+            subtitle = "Gleicht Belichtung und Weißabgleich der Zweitlinse an die Hauptlinse an.",
+            checked = uiState.colorMatch,
+            onChange = { viewModel.setColorMatch(context, it) }
+        )
+        SettingSwitch(
+            title = "Diagnose-Modus",
+            subtitle = "Speichert bei jeder Aufnahme die Rohbilder, Kamera-Metadaten und das " +
+                "Ausrichtungsergebnis unter Download/Wiggleshot.",
+            checked = uiState.diagnosticsMode,
+            onChange = { viewModel.setDiagnosticsMode(context, it) }
+        )
+
+        HorizontalDivider(color = Color(0xFF232A38))
+
+        Text(
+            text = "Experiment: Abgleich der Pixel-Kamera auslesen",
+            fontSize = 14.sp,
+            fontWeight = FontWeight.Bold,
+            color = Color.White
+        )
+        Text(
+            text = "Der HAL-Zoom-Test nimmt den logischen Kamerastrom bei 0,6×–1,2× auf, gleichzeitig " +
+                "mit den Rohbildern beider Linsen, und vergleicht, wie die Kamera-Pipeline selbst die " +
+                "0,5×-Linse auf 1× einpasst, mit unserer Messung. Am besten mit Stativ auf eine " +
+                "detailreiche Szene (> 2 m) richten.",
+            fontSize = 12.sp,
+            color = Color.Gray,
+            lineHeight = 16.sp
+        )
+
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+            Button(
+                onClick = { viewModel.runHalProbe(context) },
+                enabled = !uiState.diagnosticsBusy,
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00FFCC)),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("HAL-Test", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+            }
+            Button(
+                onClick = { viewModel.exportCameraInfo(context) },
+                enabled = !uiState.diagnosticsBusy,
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF232A38)),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("Metadaten", color = Color.White, fontSize = 12.sp)
+            }
+            Button(
+                onClick = { viewModel.resetCalibration(context) },
+                enabled = !uiState.diagnosticsBusy,
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF232A38)),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("Reset", color = Color.White, fontSize = 12.sp)
+            }
+        }
+
+        if (uiState.diagnosticsBusy || uiState.diagnosticsStatus != null) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (uiState.diagnosticsBusy) {
+                    CircularProgressIndicator(
+                        color = Color(0xFF00FFCC),
+                        strokeWidth = 2.dp,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                }
+                Text(
+                    text = uiState.diagnosticsStatus.orEmpty(),
+                    fontSize = 12.sp,
+                    color = Color(0xFFC4CFDD),
+                    fontFamily = FontFamily.Monospace,
+                    lineHeight = 16.sp
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingSwitch(title: String, subtitle: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onChange(!checked) },
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(text = title, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.White)
+            Text(text = subtitle, fontSize = 12.sp, color = Color.Gray, lineHeight = 16.sp)
+        }
+        Spacer(modifier = Modifier.width(12.dp))
+        Switch(
+            checked = checked,
+            onCheckedChange = onChange,
+            colors = SwitchDefaults.colors(
+                checkedThumbColor = Color.Black,
+                checkedTrackColor = Color(0xFF00FFCC)
+            )
+        )
     }
 }
