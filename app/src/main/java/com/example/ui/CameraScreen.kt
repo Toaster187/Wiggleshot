@@ -25,7 +25,11 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
@@ -121,6 +125,8 @@ fun CameraScreen(
         controller.applyZoom(uiState.zoomA, secondaryPreviewZoom)
     }
 
+    var flashCount by remember { mutableIntStateOf(0) }
+
     fun startCapture() {
         val activeRequest = request ?: run {
             Toast.makeText(context, "Keine Linse ausgewählt", Toast.LENGTH_SHORT).show()
@@ -128,19 +134,17 @@ fun CameraScreen(
         }
         scope.launch {
             // null means the request was ignored because a capture is already running.
-            val frames = controller.capture(activeRequest) { lens ->
+            val capture = controller.capture(activeRequest) { lens ->
                 viewModel.uiState.value.captureZoomFor(lens)
             } ?: return@launch
-
-            when {
-                frames.size >= 2 -> viewModel.processCapture(context, frames)
-                frames.size == 1 -> {
-                    frames.forEach { it.bitmap.recycle() }
-                    Toast.makeText(context, "Nur ein Frame erfasst – Aufnahme verworfen", Toast.LENGTH_SHORT).show()
-                }
-                else ->
-                    Toast.makeText(context, "Aufnahme fehlgeschlagen", Toast.LENGTH_SHORT).show()
+            if (capture.frames.isEmpty()) {
+                Toast.makeText(context, "Aufnahme fehlgeschlagen", Toast.LENGTH_SHORT).show()
+                return@launch
             }
+            // Only the JPEGs were taken; alignment runs in the background and the shutter is
+            // usable again immediately.
+            flashCount++
+            viewModel.enqueueCapture(context, capture)
         }
     }
 
@@ -152,6 +156,7 @@ fun CameraScreen(
         Viewfinder(views = views, uiState = uiState, useTextureViews = status.usesTextureViews)
 
         countdown?.let { CountdownOverlay(it) }
+        ShutterFlash(flashCount)
 
         ModeIndicator(
             simultaneous = status.simultaneous,
@@ -184,7 +189,8 @@ fun CameraScreen(
         )
 
         ShutterBar(
-            busy = status.busy || uiState.isCapturing,
+            busy = status.busy,
+            pending = uiState.pendingJobs,
             onCapture = ::startCapture,
             modifier = Modifier.align(Alignment.BottomCenter)
         )
@@ -237,7 +243,7 @@ private fun CountdownOverlay(value: Int) {
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Text(
-                text = if (value == 0) "JETZT STILL" else value.toString(),
+                text = if (value == 0) "RUHIG HALTEN" else value.toString(),
                 fontSize = if (value == 0) 30.sp else 64.sp,
                 fontWeight = FontWeight.Black,
                 color = WiggleColors.TextPrimary,
@@ -245,7 +251,7 @@ private fun CountdownOverlay(value: Int) {
             )
             Spacer(modifier = Modifier.height(10.dp))
             Text(
-                text = "Bitte ganz ruhig halten",
+                text = "Sequentieller Modus: die Linsen werden nacheinander aufgenommen",
                 fontSize = 14.sp,
                 fontWeight = FontWeight.Bold,
                 color = WiggleColors.Accent,
@@ -445,7 +451,7 @@ private fun CalibrationButton(isCalibrating: Boolean, isApplied: Boolean, onClic
 }
 
 @Composable
-private fun ShutterBar(busy: Boolean, onCapture: () -> Unit, modifier: Modifier = Modifier) {
+private fun ShutterBar(busy: Boolean, pending: Int, onCapture: () -> Unit, modifier: Modifier = Modifier) {
     Box(
         modifier = modifier
             .fillMaxWidth()
@@ -453,39 +459,66 @@ private fun ShutterBar(busy: Boolean, onCapture: () -> Unit, modifier: Modifier 
             .padding(vertical = 24.dp),
         contentAlignment = Alignment.Center
     ) {
-        if (busy) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                CircularProgressIndicator(color = WiggleColors.Accent, modifier = Modifier.size(36.dp))
-                Spacer(modifier = Modifier.height(6.dp))
-                Text(
-                    text = "ALIGNING & INTERPOLATING...",
-                    fontSize = 10.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = WiggleColors.Accent,
-                    letterSpacing = 1.sp
-                )
-            }
-        } else {
+        Box(
+            modifier = Modifier
+                .size(72.dp)
+                .padding(6.dp)
+                .border(3.dp, WiggleColors.TextPrimary, CircleShape)
+                .clickable(enabled = !busy, onClick = onCapture),
+            contentAlignment = Alignment.Center
+        ) {
             Box(
                 modifier = Modifier
-                    .size(72.dp)
-                    .padding(6.dp)
-                    .border(3.dp, WiggleColors.TextPrimary, CircleShape)
-                    .clickable(onClick = onCapture),
-                contentAlignment = Alignment.Center
+                    .size(56.dp)
+                    .background(if (busy) WiggleColors.SurfaceMuted else WiggleColors.Accent, CircleShape)
+            )
+            if (busy) {
+                CircularProgressIndicator(color = WiggleColors.Accent, modifier = Modifier.size(56.dp), strokeWidth = 3.dp)
+            }
+        }
+        if (pending > 0) {
+            Row(
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .padding(end = 24.dp)
+                    .background(WiggleColors.SurfaceElevated, RoundedCornerShape(12.dp))
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Box(modifier = Modifier.size(56.dp).background(WiggleColors.Accent, CircleShape))
+                CircularProgressIndicator(
+                    color = WiggleColors.Accent,
+                    modifier = Modifier.size(12.dp),
+                    strokeWidth = 1.5.dp
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = "$pending in Arbeit",
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = WiggleColors.TextPrimary
+                )
             }
         }
     }
 }
 
+/** Short white flash so the user sees that the picture was taken. */
+@Composable
+private fun ShutterFlash(trigger: Int) {
+    val alpha = remember { Animatable(0f) }
+    LaunchedEffect(trigger) {
+        if (trigger == 0) return@LaunchedEffect
+        alpha.snapTo(0.7f)
+        alpha.animateTo(0f, animationSpec = tween(durationMillis = 220))
+    }
+    if (alpha.value > 0f) {
+        Box(modifier = Modifier.fillMaxSize().background(Color.White.copy(alpha = alpha.value)))
+    }
+}
+
 /**
- * Takes one real capture with every lens at its full field of view and lets the view model
- * measure and store the lens pair calibration from it.
- *
- * The previous calibration compared tiny preview frames (640 px) and only searched a zoom
- * factor; it now uses the same full resolution stills and the same aligner as every capture.
+ * Takes one simultaneous capture with every lens at its full field of view and queues it to
+ * be measured and stored as the lens pair calibration.
  */
 private suspend fun runCalibration(
     context: Context,
@@ -495,22 +528,21 @@ private suspend fun runCalibration(
 ) {
     if (viewModel.uiState.value.isCalibrating) return
     viewModel.setCalibrating(true)
-    val frames = try {
+    val capture = try {
         controller.capture(request) { 1.0f }
     } catch (e: Exception) {
         android.util.Log.e("CameraScreen", "Calibration capture failed", e)
         null
     }
     when {
-        frames == null -> {
+        capture == null -> {
             viewModel.setCalibrating(false)
             Toast.makeText(context, "Kamera beschäftigt – bitte erneut versuchen", Toast.LENGTH_SHORT).show()
         }
-        frames.size < 2 -> {
-            frames.forEach { it.bitmap.recycle() }
+        capture.frames.size < 2 -> {
             viewModel.setCalibrating(false)
             Toast.makeText(context, "Kalibrierung fehlgeschlagen – Kamera nicht bereit", Toast.LENGTH_SHORT).show()
         }
-        else -> viewModel.calibrate(context, frames)
+        else -> viewModel.enqueueCalibration(context, capture)
     }
 }

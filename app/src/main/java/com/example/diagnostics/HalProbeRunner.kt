@@ -45,7 +45,22 @@ object HalProbeRunner {
 
         val probe = HalZoomProbe(context, logicalId, listOf(main.id, ultraWide.id))
         val outcome = probe.run(onProgress = onProgress)
-        if (outcome.shots.isEmpty()) return Summary("HAL-Test fehlgeschlagen: ${outcome.error}", null)
+        if (outcome.shots.isEmpty()) {
+            // Keep the protocol so the failure can be analysed.
+            val folder = DiagnosticsExporter.newFolder(context, "hal_probe_failed")
+            folder.writeJson(
+                "hal_probe.json",
+                JSONObject()
+                    .put("device", DiagnosticsExporter.deviceJson())
+                    .put("logicalId", logicalId)
+                    .put("mainId", main.id)
+                    .put("ultraWideId", ultraWide.id)
+                    .put("error", outcome.error ?: JSONObject.NULL)
+                    .put("log", JSONArray(outcome.log))
+                    .put("cameras", DiagnosticsExporter.cameraInfo(context).optJSONArray("cameras"))
+            )
+            return Summary("HAL-Test fehlgeschlagen: ${outcome.error}\nProtokoll: ${folder.displayPath}", folder.displayPath)
+        }
 
         onProgress("Analysiere …")
         return withContext(Dispatchers.Default) {
@@ -90,6 +105,7 @@ object HalProbeRunner {
                 .put("mainId", main.id)
                 .put("ultraWideId", ultraWide.id)
                 .put("withPhysicalStreams", outcome.withPhysicalStreams)
+                .put("log", JSONArray(outcome.log))
                 .put("logicalSensorOrientation", outcome.sensorOrientation)
                 .put("physicalSensorOrientations", JSONObject(outcome.physicalOrientations.mapValues { it.value }))
                 .put("logicalJpegSize", outcome.logicalJpegSize.toString())

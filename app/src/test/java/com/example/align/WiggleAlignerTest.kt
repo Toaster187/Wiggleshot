@@ -96,6 +96,53 @@ class WiggleAlignerTest {
     }
 
     @Test
+    fun wrongStoredCalibrationDoesNotWin() {
+        // Reproduces the Pixel 9 report: a stored calibration 16 % off in scale and a quarter
+        // frame off vertically must not end up in the output.
+        val scene = SyntheticScene()
+        val main = scene.render(mainCamera).toBitmap()
+        val uw = scene.render(uwCamera).toBitmap()
+        val mainLens = CameraLensDetails("w-main", "main", 6.9f, false, "w-logical")
+        val uwLens = CameraLensDetails("w-uw", "uw", 2.0f, true, "w-logical")
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val truth = scene.trueTransform(mainCamera, uwCamera)
+        val wrong = Similarity.centered(truth.scale / 1.16, 0.0, 2048.0, 1536.0, 2000.0, 1500.0)
+            .let { it.copy(ty = it.ty + 0.25 * 1500) }
+        CalibrationStore(context).update("w-main", "w-uw", wrong, 2048, 2000, replace = true)
+
+        val output = WiggleAligner(context).process(
+            frames = listOf(CapturedFrame(mainLens, main, 90), CapturedFrame(uwLens, uw, 90)),
+            zoomFor = { 1f },
+            settings = WiggleAligner.Settings(colorMatch = false)
+        )
+        val report = output.reports.single()
+        val error = report.transform.maxCornerDeviation(truth, 2048.0, 1536.0)
+        println("wrong calibration: ${report.summary()} attempts=${report.attempts} error=$error")
+        assertEquals(WiggleAligner.Source.IMAGE, report.source)
+        assertTrue("corner error $error px", error < 0.5)
+        // The bad calibration is replaced by the measurement over time, never reinforced.
+        val stored = CalibrationStore(context).get("w-main", "w-uw")!!.toPixels(2048, 2000)
+        assertTrue(abs(stored.scale - truth.scale) < abs(wrong.scale - truth.scale))
+    }
+
+    @Test
+    fun sequentialFramesNeverBecomeCalibration() {
+        val scene = SyntheticScene()
+        val mainLens = CameraLensDetails("s-main", "main", 6.9f, false, "s-logical")
+        val uwLens = CameraLensDetails("s-uw", "uw", 2.0f, true, "s-logical")
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        WiggleAligner(context).process(
+            frames = listOf(
+                CapturedFrame(mainLens, scene.render(mainCamera).toBitmap(), 90),
+                CapturedFrame(uwLens, scene.render(uwCamera).toBitmap(), 90)
+            ),
+            zoomFor = { 1f },
+            settings = WiggleAligner.Settings(colorMatch = false, simultaneous = false)
+        )
+        assertTrue(CalibrationStore(context).get("s-main", "s-uw") == null)
+    }
+
+    @Test
     fun primaryZoomCropsBothFramesIdentically() {
         val scene = SyntheticScene()
         val main = scene.render(mainCamera).toBitmap()

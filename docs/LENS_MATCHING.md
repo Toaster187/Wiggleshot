@@ -16,17 +16,38 @@ vergleichen.
 | Ergebnis nicht gespeichert | Nach jedem App-Start neu kalibrieren |
 | Kein Farbabgleich | Beide Linsen belichten und weißabgleichen getrennt → Flackern |
 
+## Erkenntnisse aus dem ersten Test auf dem Pixel 9
+
+- **Die Werkskalibrierung passt nicht zu den fertigen Bildern.** `LENS_INTRINSIC_CALIBRATION`
+  beschreibt die *unentzerrte* Optik. Der HAL entzerrt die 0,5×-Linse und zoomt dabei
+  hinein; der daraus berechnete Startwert lag ~16 % in der Skalierung und deutlich im
+  optischen Mittelpunkt daneben (Mittelpunkt-Fehler auf der langen Sensorachse wird im
+  Hochformat zum **Höhenversatz**). Die erste Version suchte nur eng um diesen Startwert,
+  fand nichts („zu wenig Struktur“) und übernahm dann den falschen Startwert.
+- **Referenz aus der Pixel-Kamera** (Screenshots 1× / 0,5× / 0,5× im Moment des
+  Linsenwechsels): Vergrößerung der 0,5× ≈ **1,93×**, Rotation ≈ 0,05°. Beim Wechsel richtet
+  die Pixel-Kamera den Hintergrund aus (Skalierung 1,006), nahe Objekte zeigen die volle
+  Parallaxe. Wiggleshot misst auf denselben Screenshots 1,926× (0,8 px Abweichung zu SIFT) –
+  auch mit absichtlich falschem Startwert.
+- Daraus folgt die **Suchstrategie** (`AlignmentStrategy`): gespeicherte Kalibrierung nur als
+  schneller erster Versuch, danach immer eine breite Suche (Skalierung ±40 % um einen
+  groben Hinweis, Verschiebung frei, kein optischer Mittelpunkt angenommen), notfalls eine
+  komplett freie Suche; der beste Treffer gewinnt. Kalibrierungen werden nur noch aus
+  gleichzeitigen Aufnahmen gelernt, alte Kalibrierungen wurden verworfen.
+- **Drehpunkt** wählbar: *Bildmitte* (klassischer Wiggle) oder *Hintergrund* (wie der
+  Linsenwechsel der Pixel-Kamera).
+
 ## Neues Verfahren
 
-Bei **jeder Aufnahme** (nicht nur beim Kalibrieren) läuft auf den echten Fotos:
+Der Auslöser nimmt nur die JPEGs beider Linsen auf (im Simultan-Modus wenige hundert
+Millisekunden) und ist sofort wieder frei. Jede Aufnahme kommt in eine Warteschlange und
+wird im Hintergrund ausgerichtet und in der Galerie gespeichert; man kann währenddessen
+weiter fotografieren. Pro Aufnahme läuft:
 
-1. **Startwert (Prior)** – in dieser Reihenfolge:
-   - die gespeicherte Kalibrierung dieses Linsenpaares (wird mit jeder sicheren Aufnahme
-     verfeinert, gleitender Mittelwert),
-   - sonst die Werkskalibrierung aus Camera2: `LENS_INTRINSIC_CALIBRATION` (Brennweite in
-     Pixeln und optischer Mittelpunkt) – im Dual-Modus sogar **pro Foto** aus dem
-     Capture-Result der jeweiligen physischen Kamera (berücksichtigt Focus Breathing),
-   - sonst Brennweite/Sensorgröße aus dem Datenblatt.
+1. **Startwerte** – die gespeicherte Kalibrierung dieses Linsenpaares (nur aus
+   gleichzeitigen Aufnahmen gelernt) für einen schnellen ersten Versuch, und ein grober
+   Skalierungshinweis aus der Camera2-Werkskalibrierung. Beides wird immer per Bildanalyse
+   bestätigt; ein Startwert allein entscheidet nie (siehe oben).
 2. **Photometrische Normierung** – lokale Kontrastnormierung entfernt Unterschiede in
    Belichtung, Weißabgleich, Vignettierung und Tonemapping.
 3. **Grobsuche** – erschöpfende ZNCC-Suche über Skalierung und Verschiebung auf ~128 px

@@ -3,61 +3,81 @@ package com.example.camera
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
+import android.graphics.Rect
 import android.util.Log
 import androidx.camera.core.ImageProxy
 
 /**
- * Bitmap conversions shared by all capture paths.
+ * JPEG handling shared by all capture paths.
+ *
+ * Capturing only copies the encoded JPEG; decoding (tens of megabytes per 4K frame) happens
+ * later in the background processing queue, so the shutter is free again right away.
  *
  * Every function returns null instead of throwing: a single decode failure must never
  * take down a capture, it only reduces the number of frames in the resulting wiggle.
- *
- * Frames are deliberately **not** zoomed or cropped here any more. The old code centre
- * cropped each lens by its zoom factor right after decoding, which threw away the area the
- * aligner needs to correct the real (off-centre) optical axis of the secondary lens.
  */
 internal object CameraImages {
     private const val TAG = "CameraImages"
 
-    class Decoded(val bitmap: Bitmap, val rotationDegrees: Int, val jpeg: ByteArray?)
+    /** An encoded frame plus what is needed to decode it upright. */
+    class Jpeg(
+        val bytes: ByteArray,
+        val rotationDegrees: Int,
+        /** Crop (CameraX viewport) in the coordinates of a [sourceWidth] x [sourceHeight] image. */
+        val crop: Rect? = null,
+        val sourceWidth: Int = 0,
+        val sourceHeight: Int = 0
+    )
 
-    /** Decodes a JPEG [ImageProxy], applies its crop rect (without stretching) and rotation. */
-    fun fromImageProxy(image: ImageProxy): Decoded? = try {
+    /** Copies the JPEG out of an [ImageProxy] without decoding it. */
+    fun jpegOf(image: ImageProxy): Jpeg? = try {
         val buffer = image.planes[0].buffer
         val bytes = ByteArray(buffer.remaining())
         buffer.get(bytes)
-        val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-        if (decoded == null) {
-            null
-        } else {
-            val crop = image.cropRect
-            val scaleX = decoded.width.toFloat() / image.width.toFloat()
-            val scaleY = decoded.height.toFloat() / image.height.toFloat()
-            val cropWidth = (crop.width() * scaleX).toInt().coerceIn(1, decoded.width)
-            val cropHeight = (crop.height() * scaleY).toInt().coerceIn(1, decoded.height)
-            val cropX = (crop.left * scaleX).toInt().coerceIn(0, decoded.width - cropWidth)
-            val cropY = (crop.top * scaleY).toInt().coerceIn(0, decoded.height - cropHeight)
-            val rotation = image.imageInfo.rotationDegrees
-            val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
-            createBitmapSafely(decoded, cropX, cropY, cropWidth, cropHeight, matrix)
-                ?.let { Decoded(it, rotation, bytes) }
-        }
+        val full = image.cropRect.left == 0 && image.cropRect.top == 0 &&
+            image.cropRect.width() == image.width && image.cropRect.height() == image.height
+        Jpeg(
+            bytes = bytes,
+            rotationDegrees = image.imageInfo.rotationDegrees,
+            crop = if (full) null else Rect(image.cropRect),
+            sourceWidth = image.width,
+            sourceHeight = image.height
+        )
     } catch (e: Exception) {
-        Log.e(TAG, "Failed converting ImageProxy", e)
-        null
-    } catch (e: OutOfMemoryError) {
-        Log.e(TAG, "Out of memory converting ImageProxy", e)
+        Log.e(TAG, "Failed copying JPEG", e)
         null
     }
 
-    /** Decodes a raw JPEG from the Camera2 path and rotates it upright. */
-    fun fromJpeg(bytes: ByteArray, rotationDegrees: Int): Bitmap? = try {
+    /** Decodes [jpeg], applies its crop (without stretching) and rotates it upright. */
+    fun decode(jpeg: Jpeg): Bitmap? =
+        decode(jpeg.bytes, jpeg.rotationDegrees, jpeg.crop, jpeg.sourceWidth, jpeg.sourceHeight)
+
+    /** Decodes a JPEG, optionally crops it and rotates it upright. */
+    fun decode(
+        bytes: ByteArray,
+        rotationDegrees: Int,
+        crop: Rect? = null,
+        sourceWidth: Int = 0,
+        sourceHeight: Int = 0
+    ): Bitmap? = try {
         val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
         if (decoded == null) {
             null
         } else {
+            var x = 0
+            var y = 0
+            var w = decoded.width
+            var h = decoded.height
+            if (crop != null && sourceWidth > 0 && sourceHeight > 0) {
+                val sx = decoded.width.toFloat() / sourceWidth
+                val sy = decoded.height.toFloat() / sourceHeight
+                w = (crop.width() * sx).toInt().coerceIn(1, decoded.width)
+                h = (crop.height() * sy).toInt().coerceIn(1, decoded.height)
+                x = (crop.left * sx).toInt().coerceIn(0, decoded.width - w)
+                y = (crop.top * sy).toInt().coerceIn(0, decoded.height - h)
+            }
             val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
-            createBitmapSafely(decoded, 0, 0, decoded.width, decoded.height, matrix)
+            createBitmapSafely(decoded, x, y, w, h, matrix)
         }
     } catch (e: Exception) {
         Log.e(TAG, "Failed decoding JPEG", e)
@@ -66,6 +86,9 @@ internal object CameraImages {
         Log.e(TAG, "Out of memory decoding JPEG", e)
         null
     }
+
+    /** Decodes a raw JPEG from the Camera2 path and rotates it upright. */
+    fun fromJpeg(bytes: ByteArray, rotationDegrees: Int): Bitmap? = decode(bytes, rotationDegrees)
 
     private fun createBitmapSafely(
         source: Bitmap,

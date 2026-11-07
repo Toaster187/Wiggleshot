@@ -22,3 +22,29 @@ class CapturedFrame(
     val width: Int = bitmap.width
     val height: Int = bitmap.height
 }
+
+/**
+ * A frame straight from the camera: still encoded, so taking it costs no decoding time and
+ * little memory. [decode] turns it into a [CapturedFrame] in the background.
+ */
+class RawFrame internal constructor(
+    val lens: CameraLensDetails,
+    internal val jpeg: CameraImages.Jpeg,
+    val appliedZoom: Float = 1f,
+    val metadata: FrameMetadata? = null
+) {
+    val bytes: ByteArray get() = jpeg.bytes
+    val rotationDegrees: Int get() = jpeg.rotationDegrees
+
+    fun decode(): CapturedFrame? = CameraImages.decode(jpeg)?.let { bitmap ->
+        CapturedFrame(lens, bitmap, jpeg.rotationDegrees, appliedZoom, metadata, jpeg.bytes)
+    }
+}
+
+/** All frames of one press of the shutter. */
+class RawCapture(
+    val frames: List<RawFrame>,
+    /** True if all frames show the same instant (dual physical session or CameraX pair). */
+    val simultaneous: Boolean,
+    val timestamp: Long = System.currentTimeMillis()
+)

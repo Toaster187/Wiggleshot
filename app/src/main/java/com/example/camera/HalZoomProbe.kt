@@ -80,7 +80,9 @@ class HalZoomProbe(
         val physicalOrientations: Map<String, Int>,
         val logicalJpegSize: Size,
         val physicalJpegSizes: Map<String, Size>,
-        val error: String?
+        val error: String?,
+        /** Step by step protocol, written to hal_probe.json. */
+        val log: List<String> = emptyList()
     )
 
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -118,9 +120,13 @@ class HalZoomProbe(
 
         var device: CameraDevice? = null
         var session: CameraCaptureSession? = null
+        val log = java.util.Collections.synchronizedList(mutableListOf<String>())
         try {
             onProgress("Öffne Kamera $logicalId …")
-            device = openWithRetry() ?: return Outcome(emptyList(), false, orientation, physicalOrientations, logicalSize, physicalSizes, "Kamera ließ sich nicht öffnen")
+            device = openWithRetry() ?: return Outcome(
+                emptyList(), false, orientation, physicalOrientations, logicalSize, physicalSizes,
+                "Kamera ließ sich nicht öffnen (von anderer App belegt?)", listOf("open failed")
+            )
 
             var withPhysical = physicalReaders.isNotEmpty()
             session = if (withPhysical) createSession(device, logicalReader, previewReader, physicalReaders) else null
@@ -130,63 +136,103 @@ class HalZoomProbe(
                 session = createSession(device, logicalReader, previewReader, emptyMap())
             }
             if (session == null) {
-                return Outcome(emptyList(), false, orientation, physicalOrientations, logicalSize, physicalSizes, "Session nicht konfigurierbar")
+                return Outcome(
+                    emptyList(), false, orientation, physicalOrientations, logicalSize, physicalSizes,
+                    "Session nicht konfigurierbar", listOf("session configuration failed")
+                )
             }
 
-            val shots = mutableListOf<Shot>()
-            for ((index, zoom) in zooms.withIndex()) {
-                onProgress("Zoom ${String.format(Locale.US, "%.2f", zoom)}× (${index + 1}/${zooms.size}) …")
+            log.add("session: " + if (withPhysical) "logical + physical streams" else "logical stream only")
+
+            suspend fun takeShot(target: CameraCaptureSession, zoom: Float, physical: Boolean): Shot? {
                 val preview = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                     addTarget(previewReader.surface)
                     set(CaptureRequest.CONTROL_ZOOM_RATIO, zoom)
                     set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                 }.build()
-                session.setRepeatingRequest(preview, null, handler)
+                target.setRepeatingRequest(preview, null, handler)
                 delay(SETTLE_MS)
 
-                val p = Pending(if (withPhysical) physicalIds else emptyList())
+                val p = Pending(if (physical) physicalIds else emptyList())
                 pending = p
                 val total = CompletableDeferred<TotalCaptureResult?>()
                 val still = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                     addTarget(logicalReader.surface)
-                    if (withPhysical) physicalReaders.values.forEach { addTarget(it.surface) }
+                    if (physical) physicalReaders.values.forEach { addTarget(it.surface) }
                     set(CaptureRequest.CONTROL_ZOOM_RATIO, zoom)
                     set(CaptureRequest.JPEG_QUALITY, 95.toByte())
                     set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                 }.build()
-                session.capture(still, object : CameraCaptureSession.CaptureCallback() {
+                target.capture(still, object : CameraCaptureSession.CaptureCallback() {
                     override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, result: TotalCaptureResult) {
                         total.complete(result)
                     }
 
                     override fun onCaptureFailed(s: CameraCaptureSession, r: CaptureRequest, failure: CaptureFailure) {
-                        Log.w(TAG, "Probe capture at $zoom failed: ${failure.reason}")
+                        log.add("zoom $zoom: capture failed, reason ${failure.reason}")
                         total.complete(null)
                     }
                 }, handler)
 
-                val shot = withTimeoutOrNull(SHOT_TIMEOUT_MS) {
-                    val result = total.await()
-                    val logicalBytes = withTimeoutOrNull(SHOT_TIMEOUT_MS) { p.logical.await() }
-                    val physicalBytes = p.physical.mapNotNull { (id, d) ->
-                        withTimeoutOrNull(1_500) { d.await() }?.let { id to it }
-                    }.toMap()
-                    Shot(
-                        requestedZoom = zoom,
-                        logicalJpeg = logicalBytes,
-                        physicalJpegs = physicalBytes,
-                        logical = result?.let { LensMetadata.fromResult(logicalId, it) },
-                        physical = result?.let { physicalMetadata(it) }.orEmpty(),
-                        activePhysicalSensorCrop = result?.let { activeCrop(it) }
-                    )
+                try {
+                    return withTimeoutOrNull<Shot?>(SHOT_TIMEOUT_MS) {
+                        val result = total.await()
+                        val logicalBytes = withTimeoutOrNull(SHOT_TIMEOUT_MS) { p.logical.await() }
+                        val physicalBytes = p.physical.mapNotNull { (id, d) ->
+                            withTimeoutOrNull(1_500) { d.await() }?.let { id to it }
+                        }.toMap()
+                        if (logicalBytes == null) {
+                            log.add("zoom $zoom: no logical JPEG (result " + (if (result == null) "missing" else "ok") + ")")
+                            return@withTimeoutOrNull null
+                        }
+                        if (physical && physicalBytes.size < physicalIds.size) {
+                            log.add("zoom $zoom: only ${physicalBytes.size}/${physicalIds.size} physical JPEGs")
+                        }
+                        Shot(
+                            requestedZoom = zoom,
+                            logicalJpeg = logicalBytes,
+                            physicalJpegs = physicalBytes,
+                            logical = result?.let { LensMetadata.fromResult(logicalId, it) },
+                            physical = result?.let { physicalMetadata(it) }.orEmpty(),
+                            activePhysicalSensorCrop = result?.let { activeCrop(it) }
+                        )
+                    } ?: run<Shot?> {
+                        log.add("zoom $zoom: timeout")
+                        null
+                    }
+                } finally {
+                    pending = null
                 }
-                pending = null
-                if (shot != null) shots += shot else Log.w(TAG, "No result for zoom $zoom")
             }
-            return Outcome(shots, withPhysical, orientation, physicalOrientations, logicalSize, physicalSizes, null)
+
+            val shots = mutableListOf<Shot>()
+            for ((index, zoom) in zooms.withIndex()) {
+                onProgress("Zoom ${String.format(Locale.US, "%.2f", zoom)}× (${index + 1}/${zooms.size}) …")
+                var shot = takeShot(session!!, zoom, withPhysical)
+                if (withPhysical && (shot == null || shot.physicalJpegs.size < physicalIds.size)) {
+                    // Some HALs configure logical + physical streams but cannot fill them in one
+                    // request. Continue with the logical stream alone instead of giving up.
+                    log.add("falling back to logical stream only")
+                    withPhysical = false
+                    runCatching { session.close() }
+                    session = createSession(device, logicalReader, previewReader, emptyMap())
+                    if (session == null) {
+                        log.add("logical-only session could not be configured")
+                        break
+                    }
+                    shot = takeShot(session, zoom, false)
+                }
+                if (shot != null) shots += shot
+            }
+            return Outcome(
+                shots, withPhysical, orientation, physicalOrientations, logicalSize, physicalSizes,
+                if (shots.isEmpty()) log.lastOrNull() ?: "keine Aufnahme" else null,
+                log
+            )
         } catch (e: Exception) {
             Log.e(TAG, "Probe failed", e)
-            return Outcome(emptyList(), false, orientation, physicalOrientations, logicalSize, physicalSizes, e.message ?: e.javaClass.simpleName)
+            log.add("exception: $e")
+            return Outcome(emptyList(), false, orientation, physicalOrientations, logicalSize, physicalSizes, e.message ?: e.javaClass.simpleName, log.toList())
         } finally {
             pending = null
             runCatching { session?.close() }

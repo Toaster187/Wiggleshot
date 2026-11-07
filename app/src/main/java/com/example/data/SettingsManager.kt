@@ -13,6 +13,7 @@ object SettingsManager {
     private const val KEY_AUTO_ALIGN = "auto_align"
     private const val KEY_COLOR_MATCH = "color_match"
     private const val KEY_DIAGNOSTICS = "diagnostics_mode"
+    private const val KEY_PIVOT = "pivot"
 
     private const val TAG = "SettingsManager"
 
@@ -40,6 +41,10 @@ object SettingsManager {
 
     fun saveDiagnosticsMode(context: Context, value: Boolean) =
         prefs(context).edit().putBoolean(KEY_DIAGNOSTICS, value).apply()
+
+    fun getPivot(context: Context): String = prefs(context).getString(KEY_PIVOT, "CENTER") ?: "CENTER"
+
+    fun savePivot(context: Context, value: String) = prefs(context).edit().putString(KEY_PIVOT, value).apply()
 
     private fun prefs(context: Context) = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 

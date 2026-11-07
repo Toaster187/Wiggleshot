@@ -89,7 +89,9 @@ class CalibrationStore(context: Context) {
 
     private companion object {
         const val TAG = "CalibrationStore"
-        const val PREFS = "lens_calibration"
+        // v2: calibrations of the first version could come from sequential frames or a
+        // wrong metadata fallback and are discarded.
+        const val PREFS = "lens_calibration_v2"
         const val MIN_ALPHA = 0.2
     }
 }

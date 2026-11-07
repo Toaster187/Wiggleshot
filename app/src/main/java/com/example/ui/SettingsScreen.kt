@@ -27,6 +27,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.align.WiggleAligner
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -579,6 +580,7 @@ private fun AlignmentSection(viewModel: WiggleViewModel, uiState: WiggleUiState)
             checked = uiState.colorMatch,
             onChange = { viewModel.setColorMatch(context, it) }
         )
+        PivotSelector(selected = uiState.pivot, onSelect = { viewModel.setPivot(context, it) })
         SettingSwitch(
             title = "Diagnose-Modus",
             subtitle = "Speichert bei jeder Aufnahme die Rohbilder, Kamera-Metadaten und das " +
@@ -624,14 +626,24 @@ private fun AlignmentSection(viewModel: WiggleViewModel, uiState: WiggleUiState)
             ) {
                 Text("Metadaten", color = Color.White, fontSize = 12.sp)
             }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
             Button(
-                onClick = { viewModel.resetCalibration(context) },
-                enabled = !uiState.diagnosticsBusy,
+                onClick = { viewModel.exportLastCapture(context) },
+                enabled = !uiState.diagnosticsBusy && uiState.hasLastCapture,
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF232A38)),
                 shape = RoundedCornerShape(12.dp),
                 modifier = Modifier.weight(1f)
             ) {
-                Text("Reset", color = Color.White, fontSize = 12.sp)
+                Text("Letzte Aufnahme exportieren", color = Color.White, fontSize = 12.sp)
+            }
+            Button(
+                onClick = { viewModel.resetCalibration(context) },
+                enabled = !uiState.diagnosticsBusy,
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF232A38)),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Text("Kalibrierung zurücksetzen", color = Color.White, fontSize = 12.sp)
             }
         }
 
@@ -678,5 +690,40 @@ private fun SettingSwitch(title: String, subtitle: String, checked: Boolean, onC
                 checkedTrackColor = Color(0xFF00FFCC)
             )
         )
+    }
+}
+
+@Composable
+private fun PivotSelector(selected: WiggleAligner.Pivot, onSelect: (WiggleAligner.Pivot) -> Unit) {
+    Column {
+        Text(text = "Drehpunkt des Wiggles", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.White)
+        Text(
+            text = "Bildmitte: das Motiv in der Mitte steht still, Vorder- und Hintergrund bewegen sich " +
+                "(klassischer Wiggle). Hintergrund: der Hintergrund steht still wie beim Linsenwechsel " +
+                "der Pixel-Kamera, nahe Objekte springen stärker.",
+            fontSize = 12.sp,
+            color = Color.Gray,
+            lineHeight = 16.sp
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            WiggleAligner.Pivot.entries.forEach { pivot ->
+                val isSelected = pivot == selected
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(if (isSelected) Color(0xFF00FFCC) else Color(0xFF232A38))
+                        .clickable { onSelect(pivot) }
+                        .padding(horizontal = 14.dp, vertical = 8.dp)
+                ) {
+                    Text(
+                        text = pivot.label,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = if (isSelected) Color.Black else Color.White
+                    )
+                }
+            }
+        }
     }
 }

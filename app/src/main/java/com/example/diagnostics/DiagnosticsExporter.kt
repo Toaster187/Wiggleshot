@@ -13,7 +13,7 @@ import com.example.align.FrameMetadata
 import com.example.align.LensGeometry
 import com.example.align.Similarity
 import com.example.align.WiggleAligner
-import com.example.camera.CapturedFrame
+import com.example.camera.RawCapture
 import com.example.camera.LensMetadata
 import org.json.JSONArray
 import org.json.JSONObject
@@ -80,15 +80,15 @@ object DiagnosticsExporter {
     /** Saves one capture's raw frames plus metadata and alignment reports. */
     fun saveCapture(
         context: Context,
-        frames: List<CapturedFrame>,
+        capture: RawCapture,
         reports: List<WiggleAligner.Report>,
-        folder: Folder = newFolder(context, "capture")
+        folder: Folder = newFolder(context, "capture"),
+        extra: JSONObject? = null
     ): String? {
         val framesJson = JSONArray()
-        frames.forEachIndexed { index, frame ->
+        capture.frames.forEachIndexed { index, frame ->
             val fileName = "frame_${index}_lens_${frame.lens.id}.jpg"
-            val jpeg = frame.jpeg
-            val saved = jpeg != null && folder.write(fileName, "image/jpeg", jpeg)
+            val saved = folder.write(fileName, "image/jpeg", frame.bytes)
             framesJson.put(
                 JSONObject()
                     .put("index", index)
@@ -96,8 +96,6 @@ object DiagnosticsExporter {
                     .put("lensId", frame.lens.id)
                     .put("lensName", frame.lens.name)
                     .put("logicalId", frame.lens.logicalId)
-                    .put("uprightWidth", frame.width)
-                    .put("uprightHeight", frame.height)
                     .put("rotationDegrees", frame.rotationDegrees)
                     .put("appliedZoom", frame.appliedZoom.toDouble())
                     .put("metadata", frame.metadata?.let(::metadataJson) ?: JSONObject.NULL)
@@ -106,8 +104,11 @@ object DiagnosticsExporter {
         }
         val json = JSONObject()
             .put("device", deviceJson())
+            .put("simultaneous", capture.simultaneous)
+            .put("timestamp", capture.timestamp)
             .put("frames", framesJson)
             .put("alignment", JSONArray().apply { reports.forEach { put(reportJson(it)) } })
+            .put("extra", extra ?: JSONObject.NULL)
             .put("cameras", cameraInfo(context).optJSONArray("cameras"))
         return if (folder.writeJson("capture.json", json)) folder.displayPath else null
     }
@@ -237,6 +238,8 @@ object DiagnosticsExporter {
         .put("baselineMm", toJson(r.baselineMm))
         .put("primarySize", "${r.primaryWidth}x${r.primaryHeight}")
         .put("secondarySize", "${r.secondaryWidth}x${r.secondaryHeight}")
+        .put("uncertain", r.uncertain)
+        .put("attempts", JSONObject(r.attempts))
         .put("summary", r.summary())
 
     fun similarityJson(t: Similarity): JSONObject = JSONObject()

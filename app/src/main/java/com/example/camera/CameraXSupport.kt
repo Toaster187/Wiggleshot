@@ -152,23 +152,21 @@ internal fun previewFor(
 }
 
 /**
- * Takes a single picture. Returns null instead of throwing so a failing lens degrades the
- * capture to fewer frames rather than aborting it.
+ * Takes a single picture and returns the encoded JPEG (no decoding, so it is fast). Returns
+ * null instead of throwing so a failing lens degrades the capture to fewer frames rather
+ * than aborting it.
  */
-internal suspend fun ImageCapture.captureDecoded(executor: Executor): CameraImages.Decoded? =
+internal suspend fun ImageCapture.captureJpeg(executor: Executor): CameraImages.Jpeg? =
     suspendCancellableCoroutine { continuation ->
         try {
             takePicture(executor, object : ImageCapture.OnImageCapturedCallback() {
                 override fun onCaptureSuccess(image: ImageProxy) {
-                    val decoded = try {
-                        CameraImages.fromImageProxy(image)
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Failed converting captured image", e)
-                        null
+                    val jpeg = try {
+                        CameraImages.jpegOf(image)
                     } finally {
                         runCatching { image.close() }
                     }
-                    if (continuation.isActive) continuation.resume(decoded)
+                    if (continuation.isActive) continuation.resume(jpeg)
                 }
 
                 override fun onError(exception: ImageCaptureException) {

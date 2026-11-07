@@ -22,10 +22,10 @@ import kotlin.math.roundToInt
  * Turns the raw frames of one capture into wiggle frames that line up.
  *
  * For every secondary lens:
- *  1. a **prior** is taken from the stored calibration of this lens pair, or else from the
- *     factory calibration in the Camera2 metadata (focal lengths and optical centres),
- *  2. [LensAligner] measures the actual transform on the captured frames,
- *  3. the secondary frame is resampled into the primary frame's geometry.
+ *  1. [AlignmentStrategy] measures the transform on the captured frames, seeded by the stored
+ *     calibration of this lens pair and a rough scale hint from the Camera2 metadata, but
+ *     always verified by a wide search, so a wrong starting value cannot win,
+ *  2. the secondary frame is resampled into the primary frame's geometry.
  *
  * Then all frames are cropped to the area every lens covers (and to the primary zoom), and
  * the colours of the secondaries are matched to the primary.
@@ -36,8 +36,20 @@ class WiggleAligner(context: Context) {
         val autoAlign: Boolean = true,
         val colorMatch: Boolean = true,
         /** Feed confident measurements back into the stored calibration. */
-        val learnCalibration: Boolean = true
+        val learnCalibration: Boolean = true,
+        /** True if all frames were taken at the same instant (dual physical / CameraX pair). */
+        val simultaneous: Boolean = true,
+        val pivot: Pivot = Pivot.CENTER
     )
+
+    /** Which depth stays still in the wiggle. */
+    enum class Pivot(val label: String) {
+        /** The subject in the image centre stays still; front and back move (classic wiggle). */
+        CENTER("Bildmitte"),
+
+        /** The dominant (usually far) background stays still, like the Pixel camera's lens switch. */
+        BACKGROUND("Hintergrund")
+    }
 
     enum class Source(val label: String) {
         IMAGE("Bildanalyse"),
@@ -67,7 +79,11 @@ class WiggleAligner(context: Context) {
         val primaryWidth: Int,
         val primaryHeight: Int,
         val secondaryWidth: Int,
-        val secondaryHeight: Int
+        val secondaryHeight: Int,
+        /** True if the image analysis failed and a fallback transform was used. */
+        val uncertain: Boolean = false,
+        /** Confidence of each search the strategy ran. */
+        val attempts: Map<String, Double> = emptyMap()
     ) {
         fun summary(): String = String.format(
             Locale.GERMANY,
@@ -75,7 +91,7 @@ class WiggleAligner(context: Context) {
             equivalentZoom,
             transform.rotationDegrees,
             confidence?.let { String.format(Locale.GERMANY, "%.0f%%", it * 100) } ?: "–",
-            source.label
+            if (uncertain) "unsicher (${source.label})" else source.label
         )
     }
 
@@ -138,8 +154,8 @@ class WiggleAligner(context: Context) {
     }
 
     /**
-     * Measures the lens pair on a fresh capture and stores it as the new calibration,
-     * replacing any previous one. Bitmaps are not modified.
+     * Measures the lens pair on a fresh simultaneous capture and stores it as the new
+     * calibration, replacing any previous one. Bitmaps are not modified.
      */
     fun calibrate(frames: List<CapturedFrame>): List<Report> {
         require(frames.size >= 2)
@@ -149,7 +165,9 @@ class WiggleAligner(context: Context) {
         return frames.drop(1).map { secondary ->
             val report = measure(primary, secondary, { gray }, factor, Settings(learnCalibration = false), ignoreStored = true)
             val global = report.global
-            if (report.source == Source.IMAGE && global != null) {
+            if (report.source == Source.IMAGE && global != null &&
+                (report.confidence ?: 0.0) >= AlignmentStrategy.LEARN_CONFIDENCE
+            ) {
                 store.update(
                     primary.lens.id, secondary.lens.id, global,
                     primary.bitmap.width, secondary.bitmap.width, replace = true
@@ -169,20 +187,17 @@ class WiggleAligner(context: Context) {
         val kp = max(1, (primary.width / WORKING_WIDTH.toDouble()).roundToInt())
         val expected = prior?.scale ?: fallbackScale
         val ks = max(1, (kp * expected).roundToInt())
-        val options = if (prior != null) {
-            LensAligner.Options()
-        } else {
-            val w = expected * kp / ks
-            LensAligner.Options(minScale = w / 2.2, maxScale = w * 2.2)
-        }
-        val result = runCatching {
-            LensAligner.align(
-                primary.toGrayImage(kp),
-                secondary.toGrayImage(ks),
-                prior?.reexpress(primaryScale = kp.toDouble(), secondaryScale = ks.toDouble()),
-                options
+        val toWorking = kp.toDouble() / ks
+        val outcome = runCatching {
+            AlignmentStrategy.run(
+                primary = primary.toGrayImage(kp),
+                secondary = secondary.toGrayImage(ks),
+                calibration = null,
+                scaleHint = expected * toWorking,
+                freeRange = (expected * toWorking / FREE_RANGE)..(expected * toWorking * FREE_RANGE)
             )
         }.onFailure { Log.e(TAG, "measurePair failed", it) }.getOrNull() ?: return null
+        val result = outcome.result ?: return null
         val toFull = { t: Similarity -> t.reexpress(primaryScale = 1.0 / kp, secondaryScale = 1.0 / ks) }
         return PairMeasurement(toFull(result.global), toFull(result.pivoted), result.confidence)
     }
@@ -217,7 +232,10 @@ class WiggleAligner(context: Context) {
 
         val geometryP = LensMetadata.geometry(cameraManager, primary.lens.id)
         val geometryS = LensMetadata.geometry(cameraManager, secondary.lens.id)
+        // The factory calibration describes the uncorrected optics; after the HAL's
+        // distortion correction only its scale is a usable (rough) hint.
         val metadataPrior = metadataPrior(primary, secondary, geometryP, geometryS)
+        val scaleHint = metadataPrior?.scale ?: focalRatioGuess(geometryP, geometryS, pw, sw)
         val stored = if (ignoreStored) {
             null
         } else {
@@ -231,34 +249,21 @@ class WiggleAligner(context: Context) {
                 zoomSecondary.compose(full.compose(unzoomPrimary))
             }
         }
-        val prior = stored ?: metadataPrior
-        val priorSource = when {
-            stored != null -> Source.CALIBRATION
-            metadataPrior != null -> Source.METADATA
-            else -> null
-        }
 
-        val expectedScale = prior?.scale ?: focalRatioGuess(geometryP, geometryS, pw, sw) ?: 0.5
+        val expectedScale = stored?.scale ?: scaleHint ?: 0.5
         val secondaryFactor = max(1, (primaryFactor * expectedScale).roundToInt())
+        val toWorking = primaryFactor.toDouble() / secondaryFactor
 
-        var result: LensAligner.Result? = null
+        var outcome: AlignmentStrategy.Outcome? = null
         try {
-            val p = primaryGray()
-            val s = toGray(secondary.bitmap, secondaryFactor)
-            val options = if (prior != null) {
-                // A stored calibration is precise; the metadata prior may use another
-                // principal point convention, so search a wider window around it.
-                if (priorSource == Source.CALIBRATION) {
-                    LensAligner.Options(priorScaleTolerance = 0.04, priorTranslationFraction = 0.06)
-                } else {
-                    LensAligner.Options(priorScaleTolerance = 0.07, priorTranslationFraction = 0.12)
-                }
-            } else {
-                val w = expectedScale * primaryFactor / secondaryFactor
-                LensAligner.Options(minScale = w / 2.2, maxScale = w * 2.2)
-            }
-            val workingPrior = prior?.reexpress(primaryScale = primaryFactor.toDouble(), secondaryScale = secondaryFactor.toDouble())
-            result = LensAligner.align(p, s, workingPrior, options)
+            outcome = AlignmentStrategy.run(
+                primary = primaryGray(),
+                secondary = toGray(secondary.bitmap, secondaryFactor),
+                calibration = stored?.reexpress(primaryScale = primaryFactor.toDouble(), secondaryScale = secondaryFactor.toDouble()),
+                scaleHint = scaleHint?.let { it * toWorking },
+                // Centred on the expected working scale (~1), so no resolution is thrown away.
+                freeRange = (expectedScale * toWorking / FREE_RANGE)..(expectedScale * toWorking * FREE_RANGE)
+            )
         } catch (e: OutOfMemoryError) {
             Log.e(TAG, "Out of memory while aligning ${secondary.lens.id}", e)
         } catch (e: Exception) {
@@ -268,25 +273,29 @@ class WiggleAligner(context: Context) {
         val toFull = { t: Similarity ->
             t.reexpress(primaryScale = 1.0 / primaryFactor, secondaryScale = 1.0 / secondaryFactor)
         }
+        val result = outcome?.result
+        val accepted = outcome?.accepted == true && result != null
         val measuredGlobal = result?.let { toFull(it.global) }
-        val measured = result?.let { toFull(it.pivoted) }
-        val accepted = result != null && measured != null && measuredGlobal != null &&
-            result.confidence >= MIN_CONFIDENCE &&
-            abs(measured.rotationDegrees) < MAX_ROTATION_DEGREES &&
-            (prior == null || abs(ln(measured.scale / prior.scale)) < MAX_SCALE_DEVIATION)
-        if (result != null && !accepted) {
-            Log.w(TAG, "Rejected alignment for ${secondary.lens.id}: $result (prior $prior)")
+        val measuredPivot = result?.let { toFull(it.pivoted) }
+        if (!accepted) {
+            Log.w(TAG, "No reliable alignment for ${secondary.lens.id}: attempts=${outcome?.attempts} best=$result")
         }
 
         val (source, transform) = when {
-            accepted -> Source.IMAGE to measured
-            prior != null -> priorSource!! to prior
+            accepted && settings.pivot == Pivot.BACKGROUND -> Source.IMAGE to measuredGlobal!!
+            accepted -> Source.IMAGE to measuredPivot!!
+            stored != null -> Source.CALIBRATION to stored
+            scaleHint != null -> Source.METADATA to Similarity.centered(scaleHint, 0.0, pw.toDouble(), ph.toDouble(), sw.toDouble(), sh.toDouble())
             else -> Source.MANUAL to Similarity.centered(expectedScale, 0.0, pw.toDouble(), ph.toDouble(), sw.toDouble(), sh.toDouble())
         }
 
+        // Only frames taken at the same instant describe the lenses; sequential frames also
+        // contain the hand movement in between and must never become the calibration.
         val unzoomed = primary.appliedZoom == 1f && secondary.appliedZoom == 1f
-        if (accepted && unzoomed && settings.learnCalibration && result.confidence >= LEARN_CONFIDENCE) {
-            store.update(primary.lens.id, secondary.lens.id, measuredGlobal, pw, sw)
+        if (accepted && unzoomed && settings.simultaneous && settings.learnCalibration &&
+            result.confidence >= AlignmentStrategy.LEARN_CONFIDENCE
+        ) {
+            store.update(primary.lens.id, secondary.lens.id, measuredGlobal!!, pw, sw)
         }
 
         return Report(
@@ -295,8 +304,12 @@ class WiggleAligner(context: Context) {
             source = source,
             transform = transform,
             global = if (accepted) measuredGlobal else null,
-            prior = prior,
-            priorSource = priorSource,
+            prior = stored ?: metadataPrior,
+            priorSource = when {
+                stored != null -> Source.CALIBRATION
+                metadataPrior != null -> Source.METADATA
+                else -> null
+            },
             confidence = result?.confidence,
             pivotShiftPx = if (accepted) result.pivotShift * primaryFactor else 0.0,
             equivalentZoom = sw / (pw * transform.scale),
@@ -307,7 +320,9 @@ class WiggleAligner(context: Context) {
             primaryWidth = pw,
             primaryHeight = ph,
             secondaryWidth = sw,
-            secondaryHeight = sh
+            secondaryHeight = sh,
+            uncertain = !accepted,
+            attempts = outcome?.attempts?.mapKeys { it.key.name }.orEmpty()
         )
     }
 
@@ -472,10 +487,8 @@ class WiggleAligner(context: Context) {
         const val TAG = "WiggleAligner"
         const val WORKING_WIDTH = 1024
         const val COLOR_SAMPLE_WIDTH = 384
-        const val MIN_CONFIDENCE = 0.2
-        const val LEARN_CONFIDENCE = 0.4
-        const val MAX_ROTATION_DEGREES = 3.0
-        /** Maximum |ln(scale / prior)|, i.e. about 12 %. */
-        const val MAX_SCALE_DEVIATION = 0.12
+
+        /** Factor around the expected scale covered by the last-resort free search. */
+        const val FREE_RANGE = 4.0
     }
 }
