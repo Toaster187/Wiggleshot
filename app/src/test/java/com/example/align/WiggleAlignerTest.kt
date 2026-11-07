@@ -126,6 +126,41 @@ class WiggleAlignerTest {
     }
 
     @Test
+    fun verticalLensErrorIsRemovedByTheMeshWarp() {
+        val scene = SyntheticScene()
+        val warpedUw = uwCamera.copy(verticalWarp = 60.0)
+        val main = scene.render(mainCamera).toBitmap()
+        val uw = scene.render(warpedUw).toBitmap()
+        val mainLens = CameraLensDetails("m-main", "main", 6.9f, false, "m-logical")
+        val uwLens = CameraLensDetails("m-uw", "uw", 2.0f, true, "m-logical")
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val output = WiggleAligner(context).process(
+            frames = listOf(CapturedFrame(mainLens, main, 90), CapturedFrame(uwLens, uw, 90)),
+            zoomFor = { 1f },
+            settings = WiggleAligner.Settings(colorMatch = false)
+        )
+        val report = output.reports.single()
+        println("mesh: ${report.summary()} patches=${report.rectifiedPatches}")
+        assertTrue("field expected", report.field != null)
+
+        // Mapping error against ground truth (background points).
+        var worst = 0.0
+        for (i in 1..9) for (j in 1..9) {
+            val x = 2048.0 * i / 10
+            val y = 1536.0 * j / 10
+            val (tx, ty) = scene.trueMapping(mainCamera, warpedUw, x, y)
+            worst = maxOf(worst, kotlin.math.hypot(report.mapX(x, y) - tx, report.mapY(x, y) - ty))
+        }
+        println("mesh mapping worst error %.2f px".format(worst))
+        assertTrue("mapping error $worst px", worst < 1.0)
+
+        // The rendered output really is aligned (the mesh is applied, not only computed).
+        val zncc = zncc(output.frames[0].toGrayImage(2).data, output.frames[1].toGrayImage(2).data)
+        println("mesh zncc=$zncc")
+        assertTrue("zncc=$zncc", zncc > 0.97)
+    }
+
+    @Test
     fun sequentialFramesNeverBecomeCalibration() {
         val scene = SyntheticScene()
         val mainLens = CameraLensDetails("s-main", "main", 6.9f, false, "s-logical")

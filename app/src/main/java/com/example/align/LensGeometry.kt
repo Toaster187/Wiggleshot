@@ -142,6 +142,21 @@ data class LensGeometry(
             return Math.toDegrees(atan2(rel[3], rel[0]))
         }
 
+        /**
+         * Direction from the primary to the secondary lens in the upright (portrait) frame, from
+         * `LENS_POSE_TRANSLATION`. The pose uses the Android sensor axes (x right, y up in the
+         * natural orientation); image y points down. Null if the pose is not published.
+         */
+        fun baselineInImage(primary: LensGeometry, secondary: LensGeometry): Pair<Double, Double>? {
+            val ta = primary.poseTranslation ?: return null
+            val tb = secondary.poseTranslation ?: return null
+            if (ta.size < 3 || tb.size < 3) return null
+            val dx = (tb[0] - ta[0]).toDouble()
+            val dy = -(tb[1] - ta[1]).toDouble()
+            val n = sqrt(dx * dx + dy * dy)
+            return if (n > 1e-4) (dx / n) to (dy / n) else null
+        }
+
         /** Baseline between two modules in millimetres from `LENS_POSE_TRANSLATION`. */
         fun baselineMm(primary: LensGeometry, secondary: LensGeometry): Double? {
             val ta = primary.poseTranslation ?: return null

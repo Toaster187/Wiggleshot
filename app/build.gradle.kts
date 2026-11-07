@@ -45,7 +45,14 @@ android {
       isCrunchPngs = false
       isMinifyEnabled = false
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-      signingConfig = signingConfigs.getByName("release")
+      // Real release key if configured, otherwise the shared debug key: the release build is
+      // not debuggable and therefore runs the alignment several times faster on the phone.
+      val releaseKey = file(System.getenv("KEYSTORE_PATH") ?: "${rootDir}/my-upload-key.jks")
+      signingConfig = if (releaseKey.exists() && System.getenv("STORE_PASSWORD") != null) {
+        signingConfigs.getByName("release")
+      } else {
+        signingConfigs.findByName("debugConfig") ?: signingConfigs.getByName("debug")
+      }
     }
     debug {
       signingConfigs.findByName("debugConfig")?.let { signingConfig = it }

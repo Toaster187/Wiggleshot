@@ -83,15 +83,31 @@ class WiggleAligner(context: Context) {
         /** True if the image analysis failed and a fallback transform was used. */
         val uncertain: Boolean = false,
         /** Confidence of each search the strategy ran. */
-        val attempts: Map<String, Double> = emptyMap()
+        val attempts: Map<String, Double> = emptyMap(),
+        /** Full mapping incl. the perpendicular correction; null = [transform] only. */
+        val field: WarpField? = null,
+        val rectifiedPatches: Int = 0,
+        /** Perpendicular misalignment before / after the correction (secondary px, rms). */
+        val rectifyRmsBefore: Double? = null,
+        val rectifyRmsAfter: Double? = null
     ) {
+        fun mapX(x: Double, y: Double): Double = field?.mapX(x, y) ?: transform.mapX(x, y)
+        fun mapY(x: Double, y: Double): Double = field?.mapY(x, y) ?: transform.mapY(x, y)
+
         fun summary(): String = String.format(
             Locale.GERMANY,
-            "Zoom %.3f× · Rot %.2f° · Q %s · %s",
+            "Zoom %.3f× · Rot %.2f° · Q %s · %s%s",
             equivalentZoom,
             transform.rotationDegrees,
             confidence?.let { String.format(Locale.GERMANY, "%.0f%%", it * 100) } ?: "–",
-            if (uncertain) "unsicher (${source.label})" else source.label
+            if (uncertain) "unsicher (${source.label})" else source.label,
+            if (rectifyRmsBefore != null && rectifyRmsAfter != null) {
+                String.format(Locale.GERMANY, " · vertikal %.1f→%.1f px", rectifyRmsBefore, rectifyRmsAfter)
+            } else if (field != null) {
+                " · vertikal kalibriert"
+            } else {
+                ""
+            }
         )
     }
 
@@ -140,7 +156,12 @@ class WiggleAligner(context: Context) {
 
         val finalReports = frames.drop(1).mapIndexed { index, secondary ->
             val report = reports[index]
-            val warped = warp(secondary.bitmap, report.transform, crop)
+            val field = report.field
+            val warped = if (field != null && !field.isIdentity) {
+                warpMesh(secondary.bitmap, field, crop)
+            } else {
+                warp(secondary.bitmap, report.transform, crop)
+            }
             secondary.bitmap.recycle()
             var correction = 0
             if (settings.colorMatch) {
@@ -236,12 +257,13 @@ class WiggleAligner(context: Context) {
         // distortion correction only its scale is a usable (rough) hint.
         val metadataPrior = metadataPrior(primary, secondary, geometryP, geometryS)
         val scaleHint = metadataPrior?.scale ?: focalRatioGuess(geometryP, geometryS, pw, sw)
-        val stored = if (ignoreStored) {
+        val storedEntry = if (ignoreStored) null else store.get(primary.lens.id, secondary.lens.id)
+        val stored = if (storedEntry == null) {
             null
         } else {
             // The calibration describes full field of view frames; account for a zoom the
             // camera applied while capturing (centred digital crop, same output size).
-            store.get(primary.lens.id, secondary.lens.id)?.toPixels(pw, sw)?.let { full ->
+            storedEntry.toPixels(pw, sw).let { full ->
                 val unzoomPrimary = Similarity.of(1.0 / primary.appliedZoom, 0.0, 0.0, 0.0)
                     .anchoredAt(pw / 2.0, ph / 2.0, pw / 2.0, ph / 2.0)
                 val zoomSecondary = Similarity.of(secondary.appliedZoom.toDouble(), 0.0, 0.0, 0.0)
@@ -249,6 +271,12 @@ class WiggleAligner(context: Context) {
                 zoomSecondary.compose(full.compose(unzoomPrimary))
             }
         }
+
+        val unzoomed = primary.appliedZoom == 1f && secondary.appliedZoom == 1f
+        // Direction from the primary to the secondary lens in the upright frame; parallax only
+        // happens along it, so everything across it is lens geometry and gets rectified.
+        val baseline = if (geometryP != null && geometryS != null) LensGeometry.baselineInImage(geometryP, geometryS) else null
+        val (baselineX, baselineY) = baseline ?: (1.0 to 0.0)
 
         val expectedScale = stored?.scale ?: scaleHint ?: 0.5
         val secondaryFactor = max(1, (primaryFactor * expectedScale).roundToInt())
@@ -262,7 +290,10 @@ class WiggleAligner(context: Context) {
                 calibration = stored?.reexpress(primaryScale = primaryFactor.toDouble(), secondaryScale = secondaryFactor.toDouble()),
                 scaleHint = scaleHint?.let { it * toWorking },
                 // Centred on the expected working scale (~1), so no resolution is thrown away.
-                freeRange = (expectedScale * toWorking / FREE_RANGE)..(expectedScale * toWorking * FREE_RANGE)
+                freeRange = (expectedScale * toWorking / FREE_RANGE)..(expectedScale * toWorking * FREE_RANGE),
+                rectify = unzoomed,
+                baselineX = baselineX,
+                baselineY = baselineY
             )
         } catch (e: OutOfMemoryError) {
             Log.e(TAG, "Out of memory while aligning ${secondary.lens.id}", e)
@@ -281,7 +312,7 @@ class WiggleAligner(context: Context) {
             Log.w(TAG, "No reliable alignment for ${secondary.lens.id}: attempts=${outcome?.attempts} best=$result")
         }
 
-        val (source, transform) = when {
+        val (source, similarity) = when {
             accepted && settings.pivot == Pivot.BACKGROUND -> Source.IMAGE to measuredGlobal!!
             accepted -> Source.IMAGE to measuredPivot!!
             stored != null -> Source.CALIBRATION to stored
@@ -289,13 +320,31 @@ class WiggleAligner(context: Context) {
             else -> Source.MANUAL to Similarity.centered(expectedScale, 0.0, pw.toDouble(), ph.toDouble(), sw.toDouble(), sh.toDouble())
         }
 
+        // Perpendicular correction: measured on this capture if possible, else the one learned
+        // for this lens pair (it is lens geometry and does not depend on the scene).
+        val measuredField = if (accepted) {
+            result.rectification?.let { r ->
+                val f = if (settings.pivot == Pivot.BACKGROUND) r.global else r.pivoted
+                f.reexpress(primaryScale = 1.0 / primaryFactor, secondaryScale = 1.0 / secondaryFactor)
+            }
+        } else {
+            null
+        }
+        val field = when {
+            measuredField != null -> measuredField
+            unzoomed && storedEntry != null && source != Source.MANUAL -> storedEntry.field(similarity, pw, ph, sw)
+            else -> null
+        }
+        val transform = field?.base ?: similarity
+
         // Only frames taken at the same instant describe the lenses; sequential frames also
         // contain the hand movement in between and must never become the calibration.
-        val unzoomed = primary.appliedZoom == 1f && secondary.appliedZoom == 1f
         if (accepted && unzoomed && settings.simultaneous && settings.learnCalibration &&
             result.confidence >= AlignmentStrategy.LEARN_CONFIDENCE
         ) {
-            store.update(primary.lens.id, secondary.lens.id, measuredGlobal!!, pw, sw)
+            val globalField = result.rectification?.global
+                ?.reexpress(primaryScale = 1.0 / primaryFactor, secondaryScale = 1.0 / secondaryFactor)
+            store.update(primary.lens.id, secondary.lens.id, measuredGlobal!!, pw, sw, field = globalField)
         }
 
         return Report(
@@ -322,7 +371,11 @@ class WiggleAligner(context: Context) {
             secondaryWidth = sw,
             secondaryHeight = sh,
             uncertain = !accepted,
-            attempts = outcome?.attempts?.mapKeys { it.key.name }.orEmpty()
+            attempts = outcome?.attempts?.mapKeys { it.key.name }.orEmpty(),
+            field = field,
+            rectifiedPatches = result?.rectification?.patches ?: 0,
+            rectifyRmsBefore = result?.rectification?.rmsBefore?.let { it * secondaryFactor },
+            rectifyRmsAfter = result?.rectification?.rmsAfter?.let { it * secondaryFactor }
         )
     }
 
@@ -412,8 +465,8 @@ class WiggleAligner(context: Context) {
             val cy = ph / 2.0
             return reports.all { r ->
                 listOf(cx - hw to cy - hh, cx + hw to cy - hh, cx - hw to cy + hh, cx + hw to cy + hh).all { (x, y) ->
-                    val sx = r.transform.mapX(x, y)
-                    val sy = r.transform.mapY(x, y)
+                    val sx = r.mapX(x, y)
+                    val sy = r.mapY(x, y)
                     sx >= 0.0 && sy >= 0.0 && sx <= r.secondaryWidth && sy <= r.secondaryHeight
                 }
             }
@@ -453,6 +506,30 @@ class WiggleAligner(context: Context) {
         return out
     }
 
+    /**
+     * Resamples [source] through a non-linear [field]. drawBitmapMesh maps a regular grid over
+     * the source bitmap to arbitrary output positions, so the inverse of the field is evaluated
+     * at the grid vertices; the field is smooth, so a 48 column mesh is exact to < 0.1 px.
+     */
+    private fun warpMesh(source: Bitmap, field: WarpField, crop: Rect): Bitmap {
+        val out = Bitmap.createBitmap(crop.width(), crop.height(), Bitmap.Config.ARGB_8888)
+        val meshW = MESH_COLUMNS
+        val meshH = max(8, (MESH_COLUMNS * source.height.toDouble() / source.width).roundToInt())
+        val verts = FloatArray((meshW + 1) * (meshH + 1) * 2)
+        var k = 0
+        for (j in 0..meshH) {
+            val sy = source.height * j.toDouble() / meshH
+            for (i in 0..meshW) {
+                val sx = source.width * i.toDouble() / meshW
+                val (px, py) = field.inverse(sx, sy)
+                verts[k++] = (px - crop.left).toFloat()
+                verts[k++] = (py - crop.top).toFloat()
+            }
+        }
+        Canvas(out).drawBitmapMesh(source, meshW, meshH, verts, 0, null, 0, Paint(Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG))
+        return out
+    }
+
     /** Matches [target]'s colours to [reference] in place; returns the largest LUT change. */
     private fun matchColors(reference: Bitmap, target: Bitmap): Int {
         val sampleW = min(COLOR_SAMPLE_WIDTH, reference.width)
@@ -487,6 +564,7 @@ class WiggleAligner(context: Context) {
         const val TAG = "WiggleAligner"
         const val WORKING_WIDTH = 1024
         const val COLOR_SAMPLE_WIDTH = 384
+        const val MESH_COLUMNS = 48
 
         /** Factor around the expected scale covered by the last-resort free search. */
         const val FREE_RANGE = 4.0

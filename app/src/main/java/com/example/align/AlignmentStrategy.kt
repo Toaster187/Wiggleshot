@@ -1,5 +1,6 @@
 package com.example.align
 
+import com.example.align.LensAligner.Options
 import kotlin.math.abs
 
 /**
@@ -59,8 +60,13 @@ object AlignmentStrategy {
         secondary: GrayImage,
         calibration: Similarity?,
         scaleHint: Double?,
-        freeRange: ClosedFloatingPointRange<Double> = 0.2..5.0
+        freeRange: ClosedFloatingPointRange<Double> = 0.2..5.0,
+        /** Also measure the correction perpendicular to the baseline ([WarpField]). */
+        rectify: Boolean = false,
+        baselineX: Double = 1.0,
+        baselineY: Double = 0.0
     ): Outcome {
+        fun Options.withRectify() = copy(rectify = rectify, baselineX = baselineX, baselineY = baselineY)
         val attempts = linkedMapOf<Path, Double>()
         var best: LensAligner.Result? = null
         var bestPath: Path? = null
@@ -68,14 +74,15 @@ object AlignmentStrategy {
         fun consider(path: Path, result: LensAligner.Result?) {
             if (result == null) return
             attempts[path] = result.confidence
-            if (best == null || result.confidence > best!!.confidence) {
+            val current = best
+            if (current == null || result.confidence > current.confidence) {
                 best = result
                 bestPath = path
             }
         }
 
         if (calibration != null) {
-            val narrow = LensAligner.Options(priorScaleTolerance = 0.04, priorTranslationFraction = 0.06)
+            val narrow = LensAligner.Options(priorScaleTolerance = 0.04, priorTranslationFraction = 0.06).withRectify()
             consider(Path.CALIBRATION, LensAligner.align(primary, secondary, calibration, narrow))
             val current = best
             if (current != null && current.confidence >= FAST_PATH_CONFIDENCE &&
@@ -87,11 +94,11 @@ object AlignmentStrategy {
 
         val hint = scaleHint ?: calibration?.scale
         if (hint != null && hint.isFinite() && hint > 0) {
-            val wide = LensAligner.Options(minScale = hint / HINT_RANGE, maxScale = hint * HINT_RANGE)
+            val wide = LensAligner.Options(minScale = hint / HINT_RANGE, maxScale = hint * HINT_RANGE).withRectify()
             consider(Path.WIDE_HINT, LensAligner.align(primary, secondary, null, wide))
         }
-        if (best == null || best!!.confidence < MIN_CONFIDENCE) {
-            val free = LensAligner.Options(minScale = freeRange.start, maxScale = freeRange.endInclusive)
+        if ((best?.confidence ?: -1.0) < MIN_CONFIDENCE) {
+            val free = LensAligner.Options(minScale = freeRange.start, maxScale = freeRange.endInclusive).withRectify()
             consider(Path.WIDE_FREE, LensAligner.align(primary, secondary, null, free))
         }
         return Outcome(best, bestPath, attempts)

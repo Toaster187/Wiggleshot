@@ -90,8 +90,20 @@ internal class SyntheticScene(seed: Long = 7L, val width: Int = 3200, val height
         val centerX: Double,
         val centerY: Double,
         /** Horizontal world shift of the foreground subject as seen by this camera (parallax). */
-        val foregroundShift: Double = 0.0
+        val foregroundShift: Double = 0.0,
+        /**
+         * Vertical lens-geometry error in pixels (v² + uv/2 pattern, like a distortion residue
+         * or module tilt): pixel (x, y) shows what an ideal camera shows at y + verticalError.
+         */
+        val verticalWarp: Double = 0.0
     ) {
+        fun verticalError(x: Double, y: Double): Double {
+            if (verticalWarp == 0.0) return 0.0
+            val u = (x - width / 2.0) / width
+            val v = (y - height / 2.0) / width
+            return verticalWarp * (v * v + 0.5 * u * v) * 4
+        }
+
         /** Similarity mapping this camera's pixels to world coordinates. */
         fun toWorld(): Similarity = Similarity.of(footprint, rotationDegrees, 0.0, 0.0)
             .anchoredAt(width / 2.0, height / 2.0, centerX, centerY)
@@ -100,6 +112,15 @@ internal class SyntheticScene(seed: Long = 7L, val width: Int = 3200, val height
     /** Ground truth primary px -> secondary px for the background (infinite depth). */
     fun trueTransform(primary: Camera, secondary: Camera): Similarity =
         secondary.toWorld().inverse().compose(primary.toWorld())
+
+    /** Ground truth including the secondary's [Camera.verticalWarp] (background points). */
+    fun trueMapping(primary: Camera, secondary: Camera, x: Double, y: Double): Pair<Double, Double> {
+        val t = trueTransform(primary, secondary)
+        val sx = t.mapX(x, y)
+        var sy = t.mapY(x, y)
+        repeat(10) { sy = t.mapY(x, y) - secondary.verticalError(sx, sy) }
+        return sx to sy
+    }
 
     data class Photometric(
         val gain: Double = 1.0,
@@ -122,7 +143,7 @@ internal class SyntheticScene(seed: Long = 7L, val width: Int = 3200, val height
         for (y in 0 until camera.height) {
             for (x in 0 until camera.width) {
                 val px = x + 0.5
-                val py = y + 0.5
+                val py = y + 0.5 + camera.verticalError(x + 0.5, y + 0.5)
                 val wx = toWorld.mapX(px, py)
                 val wy = toWorld.mapY(px, py)
                 var v = bg.sample(wx, wy).toDouble()

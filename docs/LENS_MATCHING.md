@@ -36,6 +36,20 @@ vergleichen.
   gleichzeitigen Aufnahmen gelernt, alte Kalibrierungen wurden verworfen.
 - **Drehpunkt** wählbar: *Bildmitte* (klassischer Wiggle) oder *Hintergrund* (wie der
   Linsenwechsel der Pixel-Kamera).
+- **„Die Wand bricht“ (zweiter Test):** Nach der Ähnlichkeitstransformation blieb ein
+  *vertikaler* Restversatz von bis zu ~25 px (bei 1920 px Höhe), oben und unten mit gleichem
+  Vorzeichen – Rest der Verzeichnungskorrektur bzw. Perspektive der Module, kein Wackeln.
+  Da die Linsen 16 mm *nebeneinander* sitzen (`LENS_POSE_TRANSLATION`), gibt es senkrecht
+  zur Basis keine Parallaxe; jeder Versatz dort ist Linsengeometrie. Deshalb wird jetzt pro
+  Aufnahme auf ~110 Bildfeldern gemessen und genau diese Richtung mit einem glatten
+  Polynomfeld (kubisch) korrigiert (`WarpField`, Anwendung per `drawBitmapMesh`). Die
+  horizontale Parallaxe bleibt unberührt. Auf der Testaufnahme: vertikaler Fehler Median
+  4,8 → 0,8 px, 90-%-Quantil 19 → 5 px (unabhängig per optischem Fluss gemessen). Das Feld
+  wird mit der Kalibrierung gelernt und bei strukturarmen Szenen verwendet.
+- **Geschwindigkeit:** 10,9 s pro Ausrichtung im Debug-Build auf dem Pixel 9. Die
+  0,5×-Aufnahme wird jetzt auf den erreichbaren Ausschnitt beschnitten (halbe Rechenzeit),
+  und es gibt eine nicht-debuggable Release-APK (CI-Artefakt `wiggleshot-release-apk`),
+  die deutlich schneller läuft.
 
 ## Neues Verfahren
 

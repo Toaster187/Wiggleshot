@@ -29,10 +29,17 @@ jobs:
       - name: Restore debug keystore
         run: base64 -d debug.keystore.base64 > debug.keystore
 
-      - name: Build debug APK
-        run: ./gradlew assembleDebug --no-daemon
+      - name: Build APKs
+        run: ./gradlew assembleDebug assembleRelease --no-daemon
 
-      - name: Upload APK artifact
+      - name: Upload release APK (fast, use this one on the phone)
+        uses: actions/upload-artifact@v4
+        with:
+          name: wiggleshot-release-apk
+          path: app/build/outputs/apk/release/*.apk
+          retention-days: 14
+
+      - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
           name: wiggleshot-debug-apk

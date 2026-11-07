@@ -50,6 +50,14 @@ class GrayImage(val width: Int, val height: Int, val data: FloatArray = FloatArr
 
     fun copy(): GrayImage = GrayImage(width, height, data.copyOf())
 
+    /** Sub image `[x0, x0 + w) x [y0, y0 + h)`; continuous coordinates shift by `(x0, y0)`. */
+    fun crop(x0: Int, y0: Int, w: Int, h: Int): GrayImage {
+        require(x0 >= 0 && y0 >= 0 && w > 0 && h > 0 && x0 + w <= width && y0 + h <= height)
+        val out = FloatArray(w * h)
+        for (y in 0 until h) System.arraycopy(data, (y0 + y) * width + x0, out, y * w, w)
+        return GrayImage(w, h, out)
+    }
+
     /**
      * Halves the resolution with a [1, 3, 3, 1] / 8 binomial kernel. The kernel is centred
      * between the two source pixels it replaces, so continuous coordinates map exactly as

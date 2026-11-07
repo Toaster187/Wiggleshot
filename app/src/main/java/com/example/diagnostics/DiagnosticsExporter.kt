@@ -239,6 +239,18 @@ object DiagnosticsExporter {
         .put("primarySize", "${r.primaryWidth}x${r.primaryHeight}")
         .put("secondarySize", "${r.secondaryWidth}x${r.secondaryHeight}")
         .put("uncertain", r.uncertain)
+        .put("field", r.field?.let { f ->
+            JSONObject()
+                .put("base", similarityJson(f.base))
+                .put("normal", JSONArray(listOf(f.normalX, f.normalY)))
+                .put("coefficients", JSONArray(f.coefficients.toList()))
+                .put("primarySize", "${f.primaryWidth.toInt()}x${f.primaryHeight.toInt()}")
+                .put("maxOffsetPx", f.maxOffset())
+                .put("note", "secondary = base(p) + normal * sum(c_i * basis_i(u, v)); u=(x-w/2)/w, v=(y-h/2)/w; basis 1,u,v,u2,uv,v2,u3,u2v,uv2,v3")
+        } ?: JSONObject.NULL)
+        .put("rectifiedPatches", r.rectifiedPatches)
+        .put("rectifyRmsBefore", toJson(r.rectifyRmsBefore))
+        .put("rectifyRmsAfter", toJson(r.rectifyRmsAfter))
         .put("attempts", JSONObject(r.attempts))
         .put("summary", r.summary())
 
