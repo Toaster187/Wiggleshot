@@ -40,7 +40,7 @@ fun EmptyGalleryState(modifier: Modifier = Modifier) {
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .height(110.dp)
+            .height(84.dp)
             .background(WiggleColors.Surface, RoundedCornerShape(16.dp))
             .border(1.dp, WiggleColors.Outline, RoundedCornerShape(16.dp)),
         verticalArrangement = Arrangement.Center,
@@ -48,18 +48,18 @@ fun EmptyGalleryState(modifier: Modifier = Modifier) {
     ) {
         Icon(
             imageVector = Icons.Default.PermCameraMic,
-            contentDescription = "No images",
+            contentDescription = "Keine Bilder",
             tint = WiggleColors.IconMuted,
-            modifier = Modifier.size(32.dp)
+            modifier = Modifier.size(26.dp)
         )
-        Spacer(modifier = Modifier.height(6.dp))
+        Spacer(modifier = Modifier.height(4.dp))
         Text(
-            text = "No stereoscopic animations captured yet",
+            text = "Noch keine Wiggles",
             fontSize = 12.sp,
             color = WiggleColors.TextTertiary
         )
         Text(
-            text = "Tap shutter to generate first 3D wiggle photo!",
+            text = "Auslöser drücken – das erste 3D-Wiggle erscheint hier",
             fontSize = 10.sp,
             color = WiggleColors.TextMuted
         )

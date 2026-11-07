@@ -4,8 +4,12 @@ Kurzfassung: **Motiv nah (0,4–1 m), Hintergrund weit weg (mindestens 3× so we
 die Bildmitte, Hochformat.** Warum das so ist und wie stark der Effekt wird, steht unten –
 mit Zahlen aus der Kalibrierung des Pixel 9 und aus echten Testaufnahmen.
 
-Die App zeigt nach jeder Aufnahme die gemessene **3D-Stärke** an („3D stark/mittel/schwach“)
-und gibt bei schwachem Effekt einen Tipp. In der App: **?** oben rechts → 3D-Tipps.
+Schon beim Ausrichten misst die App etwa einmal pro Sekunde die **3D-Stärke** auf den
+Vorschaubildern beider Linsen und blendet oben im Sucher Untertitel-Tipps ein (✅ stark,
+👍 mittel, ❌ schwach, dazu z. B. 👣 „Näher ran“ oder 🏞️ „Hintergrund zu nah“). Bei schneller
+Bewegung und im Energiesparmodus pausiert die Messung. Nach jeder Aufnahme wird die Stärke
+außerdem am fertigen Foto gemessen. Diese Anleitung in Kurzform: Knopf **3D-Tipps** neben dem
+Auslöser.
 
 ## Warum der kleine Linsenabstand alles bestimmt
 

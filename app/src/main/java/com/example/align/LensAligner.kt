@@ -317,6 +317,63 @@ object LensAligner {
         )
     }
 
+    /** Outcome of [measureDepth]. */
+    class DepthMeasurement(
+        /** Parallax spread along the baseline in input secondary px, null if not measurable. */
+        val depthSpread: Double?,
+        val patches: Int,
+        /** ZNCC of the normalised images under the given transform. */
+        val confidence: Double
+    )
+
+    /**
+     * Only the parallax measurement of [align] (the rectification patches), for a [transform]
+     * that is already known — e.g. from a measurement a second earlier. Skips the coarse
+     * search and the refinement, which cost most of the time; the patch search is wide enough
+     * along and across the baseline to absorb small changes of the transform (focus, OIS).
+     */
+    fun measureDepth(
+        primary: GrayImage,
+        secondary: GrayImage,
+        transform: Similarity,
+        baselineX: Double,
+        baselineY: Double
+    ): DepthMeasurement? {
+        var p = primary
+        var s = secondary
+        var pScale = 1.0
+        var sScale = 1.0
+        var internalScale = transform.scale
+        while (internalScale > 1.45 && s.width >= 64 && s.height >= 64) {
+            s = s.halve()
+            sScale *= 2
+            internalScale /= 2
+        }
+        while (internalScale < 0.69 && p.width >= 64 && p.height >= 64) {
+            p = p.halve()
+            pScale *= 2
+            internalScale *= 2
+        }
+        var internal = transform.reexpress(primaryScale = pScale, secondaryScale = sScale)
+        val options = Options(priorScaleTolerance = 0.0, priorTranslationFraction = 0.04, baselineX = baselineX, baselineY = baselineY)
+        cropRegion(p, s, internal, internal.scale, options)?.let { (x0, y0, w, h) ->
+            s = s.crop(x0, y0, w, h)
+            internal = internal.copy(tx = internal.tx - x0, ty = internal.ty - y0)
+        }
+        if (p.width < 64 || p.height < 64 || s.width < 32 || s.height < 32) return null
+
+        val pNorm = listOf(normalize(p), normalize(p.halve()))
+        val sNorm = listOf(normalize(s), normalize(s.halve()))
+        val sGrad = listOf(sNorm[0].gradients())
+        val (nx, ny) = WarpField.normalOf(baselineX, baselineY)
+        val outcome = rectify(pNorm, sNorm, sGrad, internal, nx, ny, options)
+        return DepthMeasurement(
+            depthSpread = outcome.depthSpread?.let { it * sScale },
+            patches = outcome.patches,
+            confidence = zncc(pNorm[0], sNorm[0], internal)
+        )
+    }
+
     /**
      * ZNCC between the primary and the warped secondary over their overlap. Exposed for
      * diagnostics, e.g. to compare the stored calibration against a fresh estimate.

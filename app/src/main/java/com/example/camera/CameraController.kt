@@ -155,6 +155,14 @@ class CameraController(context: Context) {
     private var msPerFrame = DEFAULT_MS_PER_FRAME
 
     /** How long a night burst of [frames] frames is expected to take. */
+    /** Latest preview exposure / focus of the primary lens (simultaneous Camera2 mode only). */
+    fun previewStats(): PreviewStats? =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && _status.value.mode == Mode.DUAL_PHYSICAL) {
+            dualSession?.latestPreview
+        } else {
+            null
+        }
+
     fun estimatedBurstMs(frames: Int): Long = (msPerFrame * frames).toLong()
 
     private fun reportBurst(done: Int) {

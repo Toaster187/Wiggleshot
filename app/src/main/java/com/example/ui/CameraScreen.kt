@@ -20,7 +20,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -55,14 +54,23 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.repeatOnLifecycle
 import com.example.camera.CameraController
-import com.example.camera.CameraLensDetails
+import com.example.live.LiveGuide
+import com.example.live.LiveAssistant
+import androidx.compose.material.icons.automirrored.filled.HelpOutline
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.CenterFocusStrong
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.animation.Crossfade
 import com.example.camera.ZoomableTextureView
 import com.example.ui.theme.WiggleColors
 import kotlinx.coroutines.launch
 import java.util.Locale
 
 /**
- * Live camera screen: viewfinder, zoom controls, calibration and shutter.
+ * Live camera screen: a large viewfinder with the live 3D tips on top (subtitle style), and
+ * one row with calibration, night mode, shutter, tips and settings below it.
  *
  * All hardware handling lives in [CameraController]; this composable only renders state and
  * forwards intents. That separation is what makes the shutter deterministic — the button no
@@ -79,6 +87,7 @@ fun CameraScreen(
     val scope = rememberCoroutineScope()
 
     val controller = remember(context) { CameraController(context) }
+    val assistant = remember(context) { LiveAssistant(context) }
     val views = remember(context) {
         CameraController.Views(
             textureA = ZoomableTextureView(context),
@@ -100,6 +109,7 @@ fun CameraScreen(
     val status by controller.status.collectAsStateWithLifecycle()
     val countdown by controller.countdown.collectAsStateWithLifecycle()
     val burstProgress by controller.burstProgress.collectAsStateWithLifecycle()
+    val tips by assistant.tips.collectAsStateWithLifecycle()
 
     val request = remember(
         uiState.primaryLens,
@@ -124,6 +134,23 @@ fun CameraScreen(
         val activeRequest = request ?: return@LaunchedEffect
         lifecycleOwner.repeatOnLifecycle(Lifecycle.State.RESUMED) {
             controller.start(activeRequest)
+        }
+    }
+
+    // Live tips: sensors and the ~1/s measurement run only while the screen is resumed.
+    val nightModeState = rememberUpdatedState(uiState.nightMode)
+    LaunchedEffect(request, lifecycleOwner) {
+        val activeRequest = request ?: return@LaunchedEffect
+        val secondary = activeRequest.secondaries.firstOrNull() ?: return@LaunchedEffect
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            assistant.startSensors()
+            try {
+                assistant.run(controller, views.textureA, views.textureB, activeRequest.primary.id, secondary.id) {
+                    nightModeState.value
+                }
+            } finally {
+                assistant.stopSensors()
+            }
         }
     }
 
@@ -156,69 +183,73 @@ fun CameraScreen(
         }
     }
 
+    fun startCalibration() {
+        val activeRequest = request
+        if (activeRequest == null || activeRequest.secondaries.isEmpty()) {
+            Toast.makeText(context, "Keine Linsen zum Kalibrieren", Toast.LENGTH_SHORT).show()
+            return
+        }
+        scope.launch {
+            runCalibration(context, controller, activeRequest, viewModel)
+            // A CameraX capture may have reset the optical zoom of the preview.
+            controller.applyZoom(uiState.zoomA, secondaryPreviewZoom)
+        }
+    }
+
     LaunchedEffect(uiState.captureTrigger) {
         if (uiState.captureTrigger > 0) startCapture()
     }
 
-    Box(modifier = modifier.fillMaxSize()) {
-        Viewfinder(views = views, uiState = uiState, useTextureViews = status.usesTextureViews)
+    // Portrait aspect of the preview stream (the SurfaceTexture delivers it upright).
+    val aspect = if (views.textureA.bufferWidth > 0f) views.textureA.bufferHeight / views.textureA.bufferWidth else 0.75f
 
-        val progress = burstProgress
-        if (progress != null) {
-            NightHoldOverlay(progress)
-        } else {
-            countdown?.let { CountdownOverlay(it) }
-            if (uiState.nightMode) {
-                NightBadge(
-                    holdMs = controller.estimatedBurstMs(viewModel.nightFrames),
-                    modifier = Modifier.align(Alignment.TopCenter).padding(top = 60.dp)
-                )
-            }
-        }
-        ShutterFlash(flashCount)
+    Column(modifier = modifier.fillMaxSize().background(Color.Black)) {
+        Box(
+            modifier = Modifier.weight(1f).fillMaxWidth(),
+            contentAlignment = Alignment.Center
+        ) {
+            // Exactly the stream's aspect ratio: nothing is cropped, so what the live
+            // measurement sees is what the viewfinder shows.
+            Box(modifier = Modifier.aspectRatio(aspect)) {
+                Viewfinder(views = views, uiState = uiState, useTextureViews = status.usesTextureViews, aspect = aspect)
 
-        ModeIndicator(
-            simultaneous = status.simultaneous,
-            night = uiState.nightMode,
-            lensCount = uiState.lensCount,
-            modifier = Modifier.align(Alignment.TopStart).padding(12.dp)
-        )
-
-        NightToggle(
-            enabled = uiState.nightMode,
-            onToggle = { viewModel.setNightMode(context, !uiState.nightMode) },
-            modifier = Modifier.align(Alignment.TopEnd).padding(12.dp)
-        )
-
-        ZoomPanel(
-            uiState = uiState,
-            viewModel = viewModel,
-            onCalibrate = {
-                val activeRequest = request
-                if (activeRequest == null || activeRequest.secondaries.isEmpty()) {
-                    Toast.makeText(context, "Keine Linsen zum Kalibrieren", Toast.LENGTH_SHORT).show()
+                val progress = burstProgress
+                if (progress != null) {
+                    NightHoldOverlay(progress)
                 } else {
-                    scope.launch {
-                        runCalibration(context, controller, activeRequest, viewModel)
-                        // A CameraX capture may have reset the optical zoom of the preview.
-                        controller.applyZoom(uiState.zoomA, secondaryPreviewZoom)
+                    countdown?.let { CountdownOverlay(it) }
+                    LiveTips(
+                        tips = tips,
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 12.dp)
+                    )
+                    if (uiState.nightMode) {
+                        NightBadge(
+                            holdMs = controller.estimatedBurstMs(viewModel.nightFrames),
+                            modifier = Modifier.align(Alignment.BottomStart).padding(12.dp)
+                        )
                     }
                 }
-            },
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp)
-                .padding(bottom = 120.dp)
-        )
+                if (uiState.pendingJobs > 0) {
+                    PendingBadge(uiState.pendingJobs, Modifier.align(Alignment.BottomEnd).padding(12.dp))
+                }
+                ShutterFlash(flashCount)
+            }
+        }
 
         ShutterBar(
             busy = status.busy,
             night = uiState.nightMode,
             burst = burstProgress,
-            pending = uiState.pendingJobs,
+            isCalibrating = uiState.isCalibrating,
+            isCalibrated = uiState.isAutoZoomApplied,
             onCapture = ::startCapture,
-            modifier = Modifier.align(Alignment.BottomCenter)
+            onCalibrate = ::startCalibration,
+            onToggleNight = { viewModel.setNightMode(context, !uiState.nightMode) },
+            onOpenGuide = viewModel::toggleGuide,
+            onOpenSettings = viewModel::toggleSettings
         )
     }
 }
@@ -227,7 +258,8 @@ fun CameraScreen(
 private fun Viewfinder(
     views: CameraController.Views,
     uiState: WiggleUiState,
-    useTextureViews: Boolean
+    useTextureViews: Boolean,
+    aspect: Float
 ) {
     Box(modifier = Modifier.fillMaxSize()) {
         AndroidView(
@@ -242,11 +274,13 @@ private fun Viewfinder(
     }
 
     // The secondary viewfinder must stay attached and drawn, otherwise its SurfaceTexture is
-    // never produced and the simultaneous modes cannot start. It is kept large enough for
-    // calibration to read a usable frame from it, but practically invisible.
+    // never produced and the simultaneous modes cannot start. Same aspect ratio as the
+    // stream, so a frame read from it for the live measurement is never cropped; practically
+    // invisible.
     Box(
         modifier = Modifier
-            .size(280.dp, 210.dp)
+            .width(150.dp)
+            .aspectRatio(aspect)
             .alpha(0.02f)
     ) {
         AndroidView(
@@ -258,6 +292,54 @@ private fun Viewfinder(
             factory = { views.previewB },
             modifier = Modifier.fillMaxSize().alpha(if (useTextureViews) 0f else 1f)
         )
+    }
+}
+
+/** Live tips, subtitle style: short lines, coloured by meaning, readable on any image. */
+@Composable
+internal fun LiveTips(tips: List<LiveGuide.Tip>, modifier: Modifier = Modifier) {
+    Crossfade(targetState = tips, animationSpec = tween(250), modifier = modifier, label = "tips") { shown ->
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            shown.forEach { tip ->
+                Text(
+                    text = "${tip.emoji}  ${tip.text}",
+                    fontSize = 16.sp,
+                    lineHeight = 21.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = tipColor(tip.level),
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier
+                        .background(Color(0xB3000000), RoundedCornerShape(8.dp))
+                        .padding(horizontal = 12.dp, vertical = 5.dp)
+                )
+            }
+        }
+    }
+}
+
+private fun tipColor(level: LiveGuide.Level): Color = when (level) {
+    LiveGuide.Level.GOOD -> Color(0xFF69F0AE)
+    LiveGuide.Level.OK -> Color(0xFFFFE082)
+    LiveGuide.Level.WARN -> Color(0xFFFFB74D)
+    LiveGuide.Level.BAD -> Color(0xFFFF8A80)
+    LiveGuide.Level.INFO -> Color(0xFF9AD8FF)
+}
+
+@Composable
+private fun PendingBadge(pending: Int, modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier
+            .background(WiggleColors.OverlayStrong, RoundedCornerShape(12.dp))
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        CircularProgressIndicator(color = WiggleColors.Accent, modifier = Modifier.size(12.dp), strokeWidth = 1.5.dp)
+        Spacer(modifier = Modifier.width(6.dp))
+        Text(text = "$pending in Arbeit", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = WiggleColors.TextPrimary)
     }
 }
 
@@ -287,62 +369,6 @@ private fun CountdownOverlay(value: Int) {
     }
 }
 
-@Composable
-private fun ModeIndicator(simultaneous: Boolean, night: Boolean, lensCount: Int, modifier: Modifier = Modifier) {
-    Box(
-        modifier = modifier
-            .background(WiggleColors.OverlayStrong, RoundedCornerShape(12.dp))
-            .border(1.dp, WiggleColors.Outline, RoundedCornerShape(12.dp))
-            .padding(horizontal = 12.dp, vertical = 8.dp)
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Box(
-                modifier = Modifier
-                    .size(8.dp)
-                    .background(if (simultaneous) WiggleColors.Accent else WiggleColors.Warning, CircleShape)
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            Text(
-                text = (if (simultaneous) "SIMULTAN (2 Linsen)" else "SEQUENTIELL ($lensCount Linsen)") +
-                    if (night) " · NACHT" else "",
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Black,
-                color = WiggleColors.TextPrimary,
-                letterSpacing = 0.5.sp
-            )
-        }
-    }
-}
-
-@Composable
-private fun NightToggle(enabled: Boolean, onToggle: () -> Unit, modifier: Modifier = Modifier) {
-    Box(
-        modifier = modifier
-            .clip(RoundedCornerShape(12.dp))
-            .background(if (enabled) NIGHT_BLUE else WiggleColors.OverlayStrong)
-            .border(1.dp, if (enabled) NIGHT_BLUE else WiggleColors.Outline, RoundedCornerShape(12.dp))
-            .clickable(onClick = onToggle)
-            .padding(horizontal = 12.dp, vertical = 8.dp)
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Icon(
-                imageVector = Icons.Default.NightsStay,
-                contentDescription = null,
-                tint = if (enabled) Color.Black else NIGHT_BLUE,
-                modifier = Modifier.size(16.dp)
-            )
-            Spacer(modifier = Modifier.width(6.dp))
-            Text(
-                text = if (enabled) "NACHT AN" else "NACHT",
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Black,
-                color = if (enabled) Color.Black else WiggleColors.TextPrimary,
-                letterSpacing = 0.5.sp
-            )
-        }
-    }
-}
-
 /** Moon badge on the live preview while night mode is armed. */
 @Composable
 internal fun NightBadge(holdMs: Long, modifier: Modifier = Modifier) {
@@ -361,7 +387,7 @@ internal fun NightBadge(holdMs: Long, modifier: Modifier = Modifier) {
         )
         Spacer(modifier = Modifier.width(8.dp))
         Text(
-            text = "NACHTMODUS · beim Auslösen ca. ${formatSeconds(holdMs)} ruhig halten",
+            text = "Nacht · ${formatSeconds(holdMs)} ruhig halten",
             fontSize = 11.sp,
             fontWeight = FontWeight.Bold,
             color = WiggleColors.TextPrimary
@@ -446,152 +472,29 @@ private val NIGHT_BLUE = Color(0xFF8AB4FF)
 
 private fun formatSeconds(ms: Long): String = String.format(Locale.GERMANY, "%.1f s", ms / 1000.0)
 
+/** Small round button with a label below, for the row next to the shutter. */
 @Composable
-private fun ZoomPanel(
-    uiState: WiggleUiState,
-    viewModel: WiggleViewModel,
-    onCalibrate: () -> Unit,
-    modifier: Modifier = Modifier
+private fun SideButton(
+    label: String,
+    enabled: Boolean = true,
+    background: Color = WiggleColors.SurfaceElevated,
+    onClick: () -> Unit,
+    content: @Composable () -> Unit
 ) {
     Column(
-        modifier = modifier
-            .background(WiggleColors.OverlaySoft, RoundedCornerShape(16.dp))
-            .border(1.dp, WiggleColors.Outline, RoundedCornerShape(16.dp))
-            .padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier.width(60.dp).alpha(if (enabled) 1f else 0.4f)
     ) {
-        uiState.primaryLens?.let { lens ->
-            LensZoomSlider(
-                label = "ZOOM (HAUPTLINSE)",
-                labelColor = WiggleColors.Accent,
-                lens = lens,
-                uiState = uiState,
-                onZoomChange = { viewModel.setZoomForLens(lens.id, it) }
-            )
-        }
-
-        if (uiState.autoAlign) {
-            AutoAlignInfo(uiState.alignmentInfo)
-        } else {
-            uiState.secondaryLenses.forEachIndexed { index, lens ->
-                LensZoomSlider(
-                    label = "ZOOM (SEKUNDÄRLINSE ${index + 1})",
-                    labelColor = WiggleColors.TextPrimary,
-                    lens = lens,
-                    uiState = uiState,
-                    onZoomChange = { viewModel.setZoomForLens(lens.id, it) }
-                )
-            }
-        }
-
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
-            CalibrationButton(
-                isCalibrating = uiState.isCalibrating,
-                isApplied = uiState.isAutoZoomApplied,
-                onClick = onCalibrate
-            )
-        }
-    }
-}
-
-@Composable
-private fun AutoAlignInfo(info: String?) {
-    Column {
-        Text(
-            text = "SEKUNDÄRLINSE: AUTO-AUSRICHTUNG",
-            fontSize = 10.sp,
-            fontWeight = FontWeight.Bold,
-            color = WiggleColors.TextPrimary
-        )
-        Text(
-            text = info ?: "Skalierung, Rotation, Versatz und Farbe werden bei jeder Aufnahme gemessen",
-            fontSize = 9.sp,
-            color = WiggleColors.TextTertiary
-        )
-    }
-}
-
-@Composable
-private fun LensZoomSlider(
-    label: String,
-    labelColor: Color,
-    lens: CameraLensDetails,
-    uiState: WiggleUiState,
-    onZoomChange: (Float) -> Unit
-) {
-    val limits = uiState.zoomLimitsFor(lens)
-    val zoom = uiState.zoomFor(lens)
-    Column {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = "$label: ${String.format(Locale.US, "%.2fx", zoom)}",
-                fontSize = 10.sp,
-                fontWeight = FontWeight.Bold,
-                color = labelColor
-            )
-            Text(text = lens.name, fontSize = 8.sp, color = Color.Gray)
-        }
-        Slider(
-            value = zoom,
-            onValueChange = onZoomChange,
-            valueRange = limits.first..limits.second,
-            modifier = Modifier.height(24.dp)
-        )
-    }
-}
-
-@Composable
-private fun CalibrationButton(isCalibrating: Boolean, isApplied: Boolean, onClick: () -> Unit) {
-    val background = when {
-        isCalibrating -> WiggleColors.SurfaceMuted
-        isApplied -> WiggleColors.Accent
-        else -> WiggleColors.SurfaceElevated
-    }
-    val outline = when {
-        isCalibrating -> WiggleColors.OutlineStrong
-        isApplied -> WiggleColors.Accent
-        else -> WiggleColors.Outline
-    }
-    Box(
-        modifier = Modifier
-            .clip(RoundedCornerShape(10.dp))
-            .background(background)
-            .border(1.dp, outline, RoundedCornerShape(10.dp))
-            .clickable(enabled = !isCalibrating, onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 6.dp),
-        contentAlignment = Alignment.Center
-    ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            if (isCalibrating) {
-                CircularProgressIndicator(
-                    color = WiggleColors.Accent,
-                    modifier = Modifier.size(12.dp),
-                    strokeWidth = 1.5.dp
-                )
-            }
-            Text(
-                text = when {
-                    isCalibrating -> "KALIBRIERE..."
-                    isApplied -> "✓ KALIBRIERT"
-                    else -> "⚡ LINSEN KALIBRIEREN"
-                },
-                fontSize = 10.sp,
-                fontWeight = FontWeight.Black,
-                color = when {
-                    isCalibrating -> WiggleColors.TextTertiary
-                    isApplied -> Color.Black
-                    else -> WiggleColors.Accent
-                },
-                letterSpacing = 0.5.sp
-            )
-        }
+        Box(
+            modifier = Modifier
+                .size(44.dp)
+                .clip(CircleShape)
+                .background(background)
+                .clickable(enabled = enabled, onClick = onClick),
+            contentAlignment = Alignment.Center
+        ) { content() }
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(text = label, fontSize = 10.sp, fontWeight = FontWeight.Bold, color = WiggleColors.TextSecondary, maxLines = 1)
     }
 }
 
@@ -600,21 +503,62 @@ internal fun ShutterBar(
     busy: Boolean,
     night: Boolean,
     burst: CameraController.BurstProgress?,
-    pending: Int,
+    isCalibrating: Boolean,
+    isCalibrated: Boolean,
     onCapture: () -> Unit,
+    onCalibrate: () -> Unit,
+    onToggleNight: () -> Unit,
+    onOpenGuide: () -> Unit,
+    onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    Box(
+    val idle = burst == null && !busy
+    Row(
         modifier = modifier
             .fillMaxWidth()
             .background(WiggleColors.Background)
-            .padding(vertical = 24.dp),
-        contentAlignment = Alignment.Center
+            .padding(horizontal = 8.dp, vertical = 12.dp),
+        horizontalArrangement = Arrangement.SpaceEvenly,
+        verticalAlignment = Alignment.CenterVertically
     ) {
+        SideButton(
+            label = when {
+                isCalibrating -> "Misst…"
+                isCalibrated -> "Kalibriert"
+                else -> "Kalibrieren"
+            },
+            enabled = idle && !isCalibrating,
+            onClick = onCalibrate
+        ) {
+            if (isCalibrating) {
+                CircularProgressIndicator(color = WiggleColors.Accent, modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+            } else {
+                Icon(
+                    imageVector = if (isCalibrated) Icons.Default.CheckCircle else Icons.Default.CenterFocusStrong,
+                    contentDescription = "Linsen kalibrieren",
+                    tint = WiggleColors.Accent,
+                    modifier = Modifier.size(22.dp)
+                )
+            }
+        }
+        SideButton(
+            label = if (night) "Nacht an" else "Nacht",
+            enabled = burst == null,
+            background = if (night) NIGHT_BLUE else WiggleColors.SurfaceElevated,
+            onClick = onToggleNight
+        ) {
+            Icon(
+                imageVector = Icons.Default.NightsStay,
+                contentDescription = "Nachtmodus",
+                tint = if (night) Color(0xFF0F1A33) else NIGHT_BLUE,
+                modifier = Modifier.size(22.dp)
+            )
+        }
+
         Box(
             modifier = Modifier
-                .size(72.dp)
-                .padding(6.dp)
+                .size(76.dp)
+                .padding(4.dp)
                 .border(
                     3.dp,
                     when {
@@ -631,13 +575,13 @@ internal fun ShutterBar(
                 burst != null -> {
                     // Night burst running: shutter blocked, ring fills while holding still.
                     val (fraction, remaining) = rememberBurstFraction(burst)
-                    Box(modifier = Modifier.size(56.dp).background(WiggleColors.SurfaceMuted, CircleShape))
+                    Box(modifier = Modifier.size(60.dp).background(WiggleColors.SurfaceMuted, CircleShape))
                     CircularProgressIndicator(
                         progress = { fraction },
                         color = NIGHT_BLUE,
                         trackColor = Color.Transparent,
                         strokeWidth = 4.dp,
-                        modifier = Modifier.size(60.dp)
+                        modifier = Modifier.size(64.dp)
                     )
                     Text(
                         text = formatSeconds(remaining),
@@ -648,13 +592,13 @@ internal fun ShutterBar(
                 }
 
                 busy -> {
-                    Box(modifier = Modifier.size(56.dp).background(WiggleColors.SurfaceMuted, CircleShape))
-                    CircularProgressIndicator(color = WiggleColors.Accent, modifier = Modifier.size(56.dp), strokeWidth = 3.dp)
+                    Box(modifier = Modifier.size(60.dp).background(WiggleColors.SurfaceMuted, CircleShape))
+                    CircularProgressIndicator(color = WiggleColors.Accent, modifier = Modifier.size(60.dp), strokeWidth = 3.dp)
                 }
 
                 night -> {
                     Box(
-                        modifier = Modifier.size(56.dp).background(NIGHT_BLUE, CircleShape),
+                        modifier = Modifier.size(60.dp).background(NIGHT_BLUE, CircleShape),
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
@@ -666,40 +610,25 @@ internal fun ShutterBar(
                     }
                 }
 
-                else -> Box(modifier = Modifier.size(56.dp).background(WiggleColors.Accent, CircleShape))
+                else -> Box(modifier = Modifier.size(60.dp).background(WiggleColors.Accent, CircleShape))
             }
         }
-        if (burst != null) {
-            Text(
-                text = "Nicht bewegen",
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
-                color = NIGHT_BLUE,
-                modifier = Modifier.align(Alignment.CenterStart).padding(start = 24.dp)
+
+        SideButton(label = "3D-Tipps", onClick = onOpenGuide) {
+            Icon(
+                imageVector = Icons.AutoMirrored.Filled.HelpOutline,
+                contentDescription = "3D-Tipps",
+                tint = WiggleColors.TextPrimary,
+                modifier = Modifier.size(22.dp)
             )
         }
-        if (pending > 0) {
-            Row(
-                modifier = Modifier
-                    .align(Alignment.CenterEnd)
-                    .padding(end = 24.dp)
-                    .background(WiggleColors.SurfaceElevated, RoundedCornerShape(12.dp))
-                    .padding(horizontal = 10.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                CircularProgressIndicator(
-                    color = WiggleColors.Accent,
-                    modifier = Modifier.size(12.dp),
-                    strokeWidth = 1.5.dp
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = "$pending in Arbeit",
-                    fontSize = 10.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = WiggleColors.TextPrimary
-                )
-            }
+        SideButton(label = "Optionen", enabled = burst == null, onClick = onOpenSettings) {
+            Icon(
+                imageVector = Icons.Default.Settings,
+                contentDescription = "Einstellungen",
+                tint = WiggleColors.TextPrimary,
+                modifier = Modifier.size(22.dp)
+            )
         }
     }
 }

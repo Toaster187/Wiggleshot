@@ -288,6 +288,38 @@ class DualPhysicalSession(
         }
     }
 
+    /** Exposure and focus of the latest preview frame of the primary lens, for the live tips. */
+    @Volatile
+    var latestPreview: PreviewStats? = null
+        private set
+
+    /** True if LENS_FOCUS_DISTANCE of the primary lens is in real diopters. */
+    val focusDistanceCalibrated: Boolean = runCatching {
+        cameraManager.getCameraCharacteristics(physicalIdA ?: logicalCameraId)
+            .get(CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION)
+    }.getOrNull().let { it != null && it != CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION_UNCALIBRATED }
+
+    private val previewCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+            val primary = physicalIdA?.let { id -> physicalResult(result, id) } ?: result
+            latestPreview = PreviewStats(
+                exposureNs = primary.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: result.get(CaptureResult.SENSOR_EXPOSURE_TIME),
+                iso = primary.get(CaptureResult.SENSOR_SENSITIVITY) ?: result.get(CaptureResult.SENSOR_SENSITIVITY),
+                focusDiopters = (primary.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: result.get(CaptureResult.LENS_FOCUS_DISTANCE))
+                    ?.takeIf { focusDistanceCalibrated },
+                timestampMs = android.os.SystemClock.elapsedRealtime()
+            )
+        }
+    }
+
+    private fun physicalResult(result: TotalCaptureResult, id: String): CaptureResult? =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            result.physicalCameraTotalResults[id]
+        } else {
+            @Suppress("DEPRECATION")
+            result.physicalCameraResults[id]
+        }
+
     private fun outputConfig(surface: Surface, physicalId: String?): OutputConfiguration =
         OutputConfiguration(surface).apply {
             if (physicalId != null && physicalId != logicalCameraId) {
@@ -309,7 +341,7 @@ class DualPhysicalSession(
                 set(CaptureRequest.CONTROL_ZOOM_RATIO, minZoomRatio)
             }
         }
-        captureSession.setRepeatingRequest(builder.build(), null, backgroundHandler)
+        captureSession.setRepeatingRequest(builder.build(), previewCallback, backgroundHandler)
         true
     } catch (e: Exception) {
         Log.e(TAG, "Could not start preview", e)

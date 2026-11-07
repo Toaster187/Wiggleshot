@@ -81,3 +81,11 @@ class RawCapture(
 
     val encodedSize: Long get() = frames.sumOf { it.encodedSize }
 }
+
+/** Exposure and focus of a preview frame. [focusDiopters] is null if the lens is not calibrated. */
+data class PreviewStats(
+    val exposureNs: Long?,
+    val iso: Int?,
+    val focusDiopters: Float?,
+    val timestampMs: Long
+)
