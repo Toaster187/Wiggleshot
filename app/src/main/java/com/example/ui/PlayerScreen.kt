@@ -228,7 +228,7 @@ fun PlayerScreen(
                             } else {
                                 isExporting = true
                                 scope.launch {
-                                    exportGif(context, frames, isPingPong, frameDelayMs.toInt())
+                                    exportGif(context, imagePaths, frames, isPingPong, frameDelayMs.toInt())
                                     isExporting = false
                                 }
                             }
@@ -284,19 +284,30 @@ private fun LoopModeButton(label: String, selected: Boolean, onClick: () -> Unit
 
 private suspend fun exportGif(
     context: Context,
-    frames: List<Bitmap>,
+    imagePaths: List<String>,
+    playbackFrames: List<Bitmap>,
     pingPong: Boolean,
     delayMs: Int
 ) {
     val result = withContext(Dispatchers.Default) {
         runCatching {
-            val exportFrames = if (pingPong && frames.size > 2) {
-                frames + frames.subList(1, frames.size - 1).reversed()
-            } else {
-                frames
+            // The playback copies are decoded small; export from the saved frames instead so
+            // the GIF gets its full resolution.
+            val decoded = imagePaths.mapNotNull {
+                WiggleProcessor.loadBitmap(it, GifEncoder.DEFAULT_MAX_DIMENSION, atLeast = true)
             }
-            val gifBytes = GifEncoder.encode(exportFrames, delayMs)
-            WiggleProcessor.saveGifToGallery(context, gifBytes, "Wiggle_${System.currentTimeMillis()}")
+            val sources = if (decoded.size == imagePaths.size && decoded.isNotEmpty()) decoded else playbackFrames
+            try {
+                val sequence = if (pingPong && sources.size > 2) {
+                    sources + sources.subList(1, sources.size - 1).reversed()
+                } else {
+                    sources
+                }
+                val gifBytes = GifEncoder.encode(sequence, delayMs)
+                WiggleProcessor.saveGifToGallery(context, gifBytes, "Wiggle_${System.currentTimeMillis()}")
+            } finally {
+                decoded.forEach { it.recycle() }
+            }
         }
     }
 

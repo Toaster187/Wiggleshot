@@ -91,14 +91,21 @@ object WiggleProcessor {
      * A wiggle can hold four 4K frames; decoding those at full size needs well over 100 MB
      * of heap and was a reliable way to get the app killed. The full resolution originals
      * are untouched in the gallery.
+     *
+     * With [atLeast] the image is instead subsampled only as far as it stays at least
+     * [maxDimension] on its longest edge, for exports that scale it down further themselves.
      */
-    fun loadBitmap(path: String, maxDimension: Int = MAX_PLAYBACK_DIMENSION): Bitmap? {
+    fun loadBitmap(path: String, maxDimension: Int = MAX_PLAYBACK_DIMENSION, atLeast: Boolean = false): Bitmap? {
         return try {
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeFile(path, bounds)
 
             val options = BitmapFactory.Options().apply {
-                inSampleSize = sampleSizeFor(bounds.outWidth, bounds.outHeight, maxDimension)
+                inSampleSize = if (atLeast) {
+                    sampleSizeAtLeast(bounds.outWidth, bounds.outHeight, maxDimension)
+                } else {
+                    sampleSizeFor(bounds.outWidth, bounds.outHeight, maxDimension)
+                }
             }
             BitmapFactory.decodeFile(path, options)
         } catch (e: Exception) {
@@ -108,6 +115,16 @@ object WiggleProcessor {
             Log.e(TAG, "Out of memory decoding file: $path", e)
             null
         }
+    }
+
+    /** Largest power-of-two subsampling that still leaves the longest edge at [minDimension] or more. */
+    private fun sampleSizeAtLeast(width: Int, height: Int, minDimension: Int): Int {
+        if (width <= 0 || height <= 0 || minDimension <= 0) return 1
+        var sampleSize = 1
+        while (maxOf(width, height) / (sampleSize * 2) >= minDimension) {
+            sampleSize *= 2
+        }
+        return sampleSize
     }
 
     private fun sampleSizeFor(width: Int, height: Int, maxDimension: Int): Int {
@@ -139,20 +156,27 @@ object WiggleProcessor {
             }
         }
 
+        val uri = try {
+            resolver.insert(imageCollection, contentValues)
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not create GIF entry in MediaStore", e)
+            null
+        } ?: return null
+
         return try {
-            val uri = resolver.insert(imageCollection, contentValues) ?: return null
-            resolver.openOutputStream(uri).use { out ->
-                out?.write(gifBytes)
-            }
+            val out = resolver.openOutputStream(uri) ?: throw java.io.IOException("No output stream for $uri")
+            out.use { it.write(gifBytes) }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 contentValues.clear()
                 contentValues.put(MediaStore.Images.Media.IS_PENDING, 0)
                 resolver.update(uri, contentValues, null, null)
             }
-            Log.d(TAG, "Successfully exported GIF to public gallery URI: $uri")
+            Log.d(TAG, "Exported GIF (${gifBytes.size} bytes) to $uri")
             uri.toString()
         } catch (e: Exception) {
             Log.e(TAG, "Error saving GIF to MediaStore", e)
+            // Do not leave an empty or half written entry behind in the gallery.
+            runCatching { resolver.delete(uri, null, null) }
             null
         }
     }
