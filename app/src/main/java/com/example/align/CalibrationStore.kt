@@ -135,7 +135,8 @@ class CalibrationStore(context: Context) {
         const val TAG = "CalibrationStore"
         // v2: calibrations of the first version could come from sequential frames or a
         // wrong metadata fallback and are discarded.
-        const val PREFS = "lens_calibration_v2"
+        // v3: keyed per secondary stream size (see WiggleAligner.calibrationKey).
+        const val PREFS = "lens_calibration_v3"
         const val MIN_ALPHA = 0.2
     }
 }

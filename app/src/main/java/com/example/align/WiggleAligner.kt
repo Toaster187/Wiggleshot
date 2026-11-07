@@ -39,8 +39,18 @@ class WiggleAligner(context: Context) {
         val learnCalibration: Boolean = true,
         /** True if all frames were taken at the same instant (dual physical / CameraX pair). */
         val simultaneous: Boolean = true,
-        val pivot: Pivot = Pivot.CENTER
+        val pivot: Pivot = Pivot.CENTER,
+        val denoise: Denoise = Denoise.AUTO
     )
+
+    /** Noise reduction of magnified secondary frames ([NoiseReducer]). */
+    enum class Denoise(val label: String, val strength: Double) {
+        OFF("Aus", 0.0),
+
+        /** Only frames that are magnified (the 0.5x lens), default strength. */
+        AUTO("Auto", 1.0),
+        STRONG("Stark", 1.8)
+    }
 
     /** Which depth stays still in the wiggle. */
     enum class Pivot(val label: String) {
@@ -89,7 +99,11 @@ class WiggleAligner(context: Context) {
         val rectifiedPatches: Int = 0,
         /** Perpendicular misalignment before / after the correction (secondary px, rms). */
         val rectifyRmsBefore: Double? = null,
-        val rectifyRmsAfter: Double? = null
+        val rectifyRmsAfter: Double? = null,
+        /** Noise reduction applied to this frame (null = none). */
+        val noiseSigma: Double? = null,
+        val speckPixels: Int = 0,
+        val denoiseMs: Long = 0
     ) {
         fun mapX(x: Double, y: Double): Double = field?.mapX(x, y) ?: transform.mapX(x, y)
         fun mapY(x: Double, y: Double): Double = field?.mapY(x, y) ?: transform.mapY(x, y)
@@ -156,19 +170,33 @@ class WiggleAligner(context: Context) {
 
         val finalReports = frames.drop(1).mapIndexed { index, secondary ->
             val report = reports[index]
+            // Magnified frames (the 0.5x lens) are denoised at their native resolution first,
+            // only on the part that ends up in the output.
+            val denoise = settings.denoise != Denoise.OFF &&
+                (settings.denoise == Denoise.STRONG || report.equivalentZoom >= DENOISE_MIN_ZOOM)
+            val region = if (denoise) denoisedRegion(secondary.bitmap, report, crop, settings.denoise.strength) else null
+            val source = region?.bitmap ?: secondary.bitmap
+            val ox = region?.left?.toDouble() ?: 0.0
+            val oy = region?.top?.toDouble() ?: 0.0
             val field = report.field
             val warped = if (field != null && !field.isIdentity) {
-                warpMesh(secondary.bitmap, field, crop)
+                warpMesh(source, field.withBase(field.base.copy(tx = field.base.tx - ox, ty = field.base.ty - oy)), crop)
             } else {
-                warp(secondary.bitmap, report.transform, crop)
+                warp(source, report.transform.copy(tx = report.transform.tx - ox, ty = report.transform.ty - oy), crop)
             }
+            region?.bitmap?.recycle()
             secondary.bitmap.recycle()
             var correction = 0
             if (settings.colorMatch) {
                 correction = matchColors(primaryOut, warped)
             }
             outFrames += warped
-            report.copy(colorCorrection = correction)
+            report.copy(
+                colorCorrection = correction,
+                noiseSigma = region?.stats?.mottleSigma,
+                speckPixels = region?.stats?.speckPixels ?: 0,
+                denoiseMs = region?.stats?.elapsedMs ?: 0
+            )
         }
         finalReports.forEach { Log.d(TAG, "Lens ${it.lensId}: ${it.summary()} transform=${it.transform}") }
         return Output(outFrames, finalReports, crop)
@@ -190,8 +218,13 @@ class WiggleAligner(context: Context) {
                 (report.confidence ?: 0.0) >= AlignmentStrategy.LEARN_CONFIDENCE
             ) {
                 store.update(
-                    primary.lens.id, secondary.lens.id, global,
-                    primary.bitmap.width, secondary.bitmap.width, replace = true
+                    primary.lens.id,
+                    calibrationKey(secondary.lens.id, secondary.bitmap.width, secondary.bitmap.height),
+                    global,
+                    primary.bitmap.width,
+                    secondary.bitmap.width,
+                    replace = true,
+                    field = report.field
                 )
             }
             report
@@ -232,8 +265,8 @@ class WiggleAligner(context: Context) {
 
     fun clearCalibration() = store.clear()
 
-    fun storedCalibration(primaryId: String, secondaryId: String): CalibrationStore.Entry? =
-        store.get(primaryId, secondaryId)
+    fun storedCalibration(primaryId: String, secondaryId: String, secondaryWidth: Int, secondaryHeight: Int): CalibrationStore.Entry? =
+        store.get(primaryId, calibrationKey(secondaryId, secondaryWidth, secondaryHeight))
 
     // ------------------------------------------------------------------------------------
 
@@ -257,7 +290,8 @@ class WiggleAligner(context: Context) {
         // distortion correction only its scale is a usable (rough) hint.
         val metadataPrior = metadataPrior(primary, secondary, geometryP, geometryS)
         val scaleHint = metadataPrior?.scale ?: focalRatioGuess(geometryP, geometryS, pw, sw)
-        val storedEntry = if (ignoreStored) null else store.get(primary.lens.id, secondary.lens.id)
+        val secondaryKey = calibrationKey(secondary.lens.id, sw, sh)
+        val storedEntry = if (ignoreStored) null else store.get(primary.lens.id, secondaryKey)
         val stored = if (storedEntry == null) {
             null
         } else {
@@ -344,7 +378,7 @@ class WiggleAligner(context: Context) {
         ) {
             val globalField = result.rectification?.global
                 ?.reexpress(primaryScale = 1.0 / primaryFactor, secondaryScale = 1.0 / secondaryFactor)
-            store.update(primary.lens.id, secondary.lens.id, measuredGlobal!!, pw, sw, field = globalField)
+            store.update(primary.lens.id, secondaryKey, measuredGlobal!!, pw, sw, field = globalField)
         }
 
         return Report(
@@ -506,6 +540,46 @@ class WiggleAligner(context: Context) {
         return out
     }
 
+    private class DenoisedRegion(val bitmap: Bitmap, val left: Int, val top: Int, val stats: NoiseReducer.Stats)
+
+    /**
+     * Copies the part of [source] that [report] maps into [crop], denoises it and returns it
+     * with its offset; null if that part is empty.
+     */
+    private fun denoisedRegion(source: Bitmap, report: Report, crop: Rect, strength: Double): DenoisedRegion? = try {
+        var minX = Double.MAX_VALUE
+        var minY = Double.MAX_VALUE
+        var maxX = -Double.MAX_VALUE
+        var maxY = -Double.MAX_VALUE
+        val steps = 16
+        for (i in 0..steps) for (edge in 0 until 4) {
+            val t = i.toDouble() / steps
+            val (x, y) = when (edge) {
+                0 -> crop.left + t * crop.width() to crop.top.toDouble()
+                1 -> crop.left + t * crop.width() to crop.bottom.toDouble()
+                2 -> crop.left.toDouble() to crop.top + t * crop.height()
+                else -> crop.right.toDouble() to crop.top + t * crop.height()
+            }
+            val sx = report.mapX(x, y)
+            val sy = report.mapY(x, y)
+            minX = min(minX, sx); maxX = max(maxX, sx); minY = min(minY, sy); maxY = max(maxY, sy)
+        }
+        val left = (minX - DENOISE_MARGIN).toInt().coerceIn(0, source.width - 1)
+        val top = (minY - DENOISE_MARGIN).toInt().coerceIn(0, source.height - 1)
+        val right = (maxX + DENOISE_MARGIN).toInt().coerceIn(left + 1, source.width)
+        val bottom = (maxY + DENOISE_MARGIN).toInt().coerceIn(top + 1, source.height)
+        val w = right - left
+        val h = bottom - top
+        val pixels = IntArray(w * h)
+        source.getPixels(pixels, 0, w, left, top, w, h)
+        val stats = NoiseReducer.denoiseInStrips(pixels, w, h, strength)
+        Log.d(TAG, "Denoised ${w}x$h: sigma=%.2f specks=${stats.speckPixels} ${stats.elapsedMs}ms".format(stats.mottleSigma))
+        DenoisedRegion(Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888), left, top, stats)
+    } catch (e: OutOfMemoryError) {
+        Log.e(TAG, "Out of memory while denoising", e)
+        null
+    }
+
     /**
      * Resamples [source] through a non-linear [field]. drawBitmapMesh maps a regular grid over
      * the source bitmap to arbitrary output positions, so the inverse of the field is evaluated
@@ -565,6 +639,18 @@ class WiggleAligner(context: Context) {
         const val WORKING_WIDTH = 1024
         const val COLOR_SAMPLE_WIDTH = 384
         const val MESH_COLUMNS = 48
+
+        /** Secondary frames magnified at least this much are denoised in AUTO mode. */
+        const val DENOISE_MIN_ZOOM = 1.3
+
+        /** Context around the used region: guided filter radius plus interpolation. */
+        const val DENOISE_MARGIN = 24.0
+
+        /**
+         * Calibrations are kept per secondary stream size: on the Pixel 9 the 0.5x lens shows
+         * a different field of view in HD (1920x1440) than in 4K (4032x3024).
+         */
+        fun calibrationKey(lensId: String, width: Int, height: Int) = "$lensId@${width}x$height"
 
         /** Factor around the expected scale covered by the last-resort free search. */
         const val FREE_RANGE = 4.0

@@ -14,6 +14,7 @@ object SettingsManager {
     private const val KEY_COLOR_MATCH = "color_match"
     private const val KEY_DIAGNOSTICS = "diagnostics_mode"
     private const val KEY_PIVOT = "pivot"
+    private const val KEY_DENOISE = "denoise_secondary"
 
     private const val TAG = "SettingsManager"
 
@@ -45,6 +46,10 @@ object SettingsManager {
     fun getPivot(context: Context): String = prefs(context).getString(KEY_PIVOT, "CENTER") ?: "CENTER"
 
     fun savePivot(context: Context, value: String) = prefs(context).edit().putString(KEY_PIVOT, value).apply()
+
+    fun getDenoise(context: Context): String = prefs(context).getString(KEY_DENOISE, "AUTO") ?: "AUTO"
+
+    fun saveDenoise(context: Context, value: String) = prefs(context).edit().putString(KEY_DENOISE, value).apply()
 
     private fun prefs(context: Context) = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 

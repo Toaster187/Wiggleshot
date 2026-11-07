@@ -64,6 +64,7 @@ data class WiggleUiState(
     /** Captures waiting for or in background alignment. The shutter stays usable meanwhile. */
     val pendingJobs: Int = 0,
     val pivot: WiggleAligner.Pivot = WiggleAligner.Pivot.CENTER,
+    val denoise: WiggleAligner.Denoise = WiggleAligner.Denoise.AUTO,
     /** True once a capture has been taken that "export last capture" can write out. */
     val hasLastCapture: Boolean = false
 ) {
@@ -131,6 +132,8 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
                 val savedDiagnostics = SettingsManager.getDiagnosticsMode(context)
                 val savedPivot = runCatching { WiggleAligner.Pivot.valueOf(SettingsManager.getPivot(context)) }
                     .getOrDefault(WiggleAligner.Pivot.CENTER)
+                val savedDenoise = runCatching { WiggleAligner.Denoise.valueOf(SettingsManager.getDenoise(context)) }
+                    .getOrDefault(WiggleAligner.Denoise.AUTO)
 
                 val primary = lenses.firstOrNull { it.id == savedPrimaryId }
                     ?: lenses.firstOrNull { !it.isDefaultUltraWide && it.isPhysical }
@@ -161,6 +164,7 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
                         colorMatch = savedColorMatch,
                         diagnosticsMode = savedDiagnostics,
                         pivot = savedPivot,
+                        denoise = savedDenoise,
                         concurrentPreviewSupported = discovery.concurrentPreviewSupported,
                         previewStateMessage = if (discovery.concurrentPreviewSupported) {
                             "Dual Cameras Active"
@@ -380,7 +384,8 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
                 autoAlign = state.autoAlign,
                 colorMatch = state.colorMatch,
                 simultaneous = job.capture.simultaneous,
-                pivot = state.pivot
+                pivot = state.pivot,
+                denoise = state.denoise
             )
         )
         lastCapture = job.capture to output.reports
@@ -417,6 +422,11 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
             val text = path?.let { "Gespeichert in $it" } ?: "Export fehlgeschlagen"
             _uiState.update { it.copy(diagnosticsBusy = false, diagnosticsStatus = text, message = text) }
         }
+    }
+
+    fun setDenoise(context: Context, denoise: WiggleAligner.Denoise) {
+        SettingsManager.saveDenoise(context, denoise.name)
+        _uiState.update { it.copy(denoise = denoise) }
     }
 
     fun setPivot(context: Context, pivot: WiggleAligner.Pivot) {

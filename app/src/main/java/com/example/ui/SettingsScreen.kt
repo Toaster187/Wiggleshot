@@ -581,6 +581,15 @@ private fun AlignmentSection(viewModel: WiggleViewModel, uiState: WiggleUiState)
             onChange = { viewModel.setColorMatch(context, it) }
         )
         PivotSelector(selected = uiState.pivot, onSelect = { viewModel.setPivot(context, it) })
+        ChipSelector(
+            title = "Rauschfilter 0,5×",
+            subtitle = "Die 0,5×-Linse hat einen ~3× kleineren Sensor und wird ~2,3× vergrößert; bei " +
+                "wenig Licht entstehen Farbflecken und dunkle Pünktchen. Der Filter entfernt sie vor " +
+                "dem Vergrößern und erhält Kanten und feine Linien.",
+            options = WiggleAligner.Denoise.entries.map { it to it.label },
+            selected = uiState.denoise,
+            onSelect = { viewModel.setDenoise(context, it) }
+        )
         SettingSwitch(
             title = "Diagnose-Modus",
             subtitle = "Speichert bei jeder Aufnahme die Rohbilder, Kamera-Metadaten und das " +
@@ -718,6 +727,40 @@ private fun PivotSelector(selected: WiggleAligner.Pivot, onSelect: (WiggleAligne
                 ) {
                     Text(
                         text = pivot.label,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = if (isSelected) Color.Black else Color.White
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun <T> ChipSelector(
+    title: String,
+    subtitle: String,
+    options: List<Pair<T, String>>,
+    selected: T,
+    onSelect: (T) -> Unit
+) {
+    Column {
+        Text(text = title, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.White)
+        Text(text = subtitle, fontSize = 12.sp, color = Color.Gray, lineHeight = 16.sp)
+        Spacer(modifier = Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            options.forEach { (value, label) ->
+                val isSelected = value == selected
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(if (isSelected) Color(0xFF00FFCC) else Color(0xFF232A38))
+                        .clickable { onSelect(value) }
+                        .padding(horizontal = 14.dp, vertical = 8.dp)
+                ) {
+                    Text(
+                        text = label,
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Bold,
                         color = if (isSelected) Color.Black else Color.White

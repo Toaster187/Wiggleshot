@@ -92,7 +92,7 @@ class WiggleAlignerTest {
         }
 
         // A confident measurement is learned as calibration.
-        assertTrue(aligner.storedCalibration("test-main", "test-uw") != null)
+        assertTrue(aligner.storedCalibration("test-main", "test-uw", 2000, 1500) != null)
     }
 
     @Test
@@ -108,7 +108,7 @@ class WiggleAlignerTest {
         val truth = scene.trueTransform(mainCamera, uwCamera)
         val wrong = Similarity.centered(truth.scale / 1.16, 0.0, 2048.0, 1536.0, 2000.0, 1500.0)
             .let { it.copy(ty = it.ty + 0.25 * 1500) }
-        CalibrationStore(context).update("w-main", "w-uw", wrong, 2048, 2000, replace = true)
+        CalibrationStore(context).update("w-main", "w-uw@2000x1500", wrong, 2048, 2000, replace = true)
 
         val output = WiggleAligner(context).process(
             frames = listOf(CapturedFrame(mainLens, main, 90), CapturedFrame(uwLens, uw, 90)),
@@ -121,7 +121,7 @@ class WiggleAlignerTest {
         assertEquals(WiggleAligner.Source.IMAGE, report.source)
         assertTrue("corner error $error px", error < 0.5)
         // The bad calibration is replaced by the measurement over time, never reinforced.
-        val stored = CalibrationStore(context).get("w-main", "w-uw")!!.toPixels(2048, 2000)
+        val stored = CalibrationStore(context).get("w-main", "w-uw@2000x1500")!!.toPixels(2048, 2000)
         assertTrue(abs(stored.scale - truth.scale) < abs(wrong.scale - truth.scale))
     }
 
@@ -174,7 +174,7 @@ class WiggleAlignerTest {
             zoomFor = { 1f },
             settings = WiggleAligner.Settings(colorMatch = false, simultaneous = false)
         )
-        assertTrue(CalibrationStore(context).get("s-main", "s-uw") == null)
+        assertTrue(CalibrationStore(context).get("s-main", "s-uw@2000x1500") == null)
     }
 
     @Test

@@ -46,6 +46,19 @@ vergleichen.
   horizontale Parallaxe bleibt unberührt. Auf der Testaufnahme: vertikaler Fehler Median
   4,8 → 0,8 px, 90-%-Quantil 19 → 5 px (unabhängig per optischem Fluss gemessen). Das Feld
   wird mit der Kalibrierung gelernt und bei strukturarmen Szenen verwendet.
+- **Rauschen der 0,5× (dritter Test, wenig Licht: 1/15 s, ISO ~290):** Der Sensor der
+  0,5× hat ~1/3 der Fläche der Hauptkamera, ihr Bild ist trotz gleicher Belichtung dunkler
+  (Helligkeit 46 statt 61) und wird 2,3× vergrößert. Dabei wird Restrauschen zu groben
+  Flecken, dazu kommen 1–3 px große dunkle Ausreißer des Sensors. Schärfe war in Ordnung
+  (beide fokussiert, 1,7 m / 2,0 m). `NoiseReducer` entfernt vor dem Vergrößern kleine
+  Ausreißer (Closing/Opening, nur Flecken ≤ 8 px Fläche), glättet Fleckenrauschen mit einem
+  kantenerhaltenden Guided Filter und Farbflecken mit einem luma-geführten Filter.
+  Gemessen auf der Testaufnahme: Fleckenrauschen 1,21 → 0,61 (Hauptkamera 0,46),
+  Farbrauschen 0,14 → 0,05 (Hauptkamera 0,04). Einstellung „Rauschfilter 0,5×“.
+  Mehrbild-Rauschreduzierung (Burst + Mittelung) wäre der nächste Schritt.
+- **Kalibrierung pro Auflösung:** Der HD-Stream der 0,5× hat ein anderes Bildfeld als der
+  4K-Stream (1,68× statt 2,32× Vergrößerung); Kalibrierungen werden daher pro Streamgröße
+  gespeichert.
 - **Geschwindigkeit:** 10,9 s pro Ausrichtung im Debug-Build auf dem Pixel 9. Die
   0,5×-Aufnahme wird jetzt auf den erreichbaren Ausschnitt beschnitten (halbe Rechenzeit),
   und es gibt eine nicht-debuggable Release-APK (CI-Artefakt `wiggleshot-release-apk`),
