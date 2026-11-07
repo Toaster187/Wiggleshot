@@ -92,6 +92,7 @@ fun CameraScreen(
 
     val status by controller.status.collectAsStateWithLifecycle()
     val countdown by controller.countdown.collectAsStateWithLifecycle()
+    val burstProgress by controller.burstProgress.collectAsStateWithLifecycle()
 
     val request = remember(
         uiState.primaryLens,
@@ -134,7 +135,7 @@ fun CameraScreen(
         }
         scope.launch {
             // null means the request was ignored because a capture is already running.
-            val capture = controller.capture(activeRequest) { lens ->
+            val capture = controller.capture(activeRequest, burst = viewModel.burstFrames()) { lens ->
                 viewModel.uiState.value.captureZoomFor(lens)
             } ?: return@launch
             if (capture.frames.isEmpty()) {
@@ -155,16 +156,26 @@ fun CameraScreen(
     Box(modifier = modifier.fillMaxSize()) {
         Viewfinder(views = views, uiState = uiState, useTextureViews = status.usesTextureViews)
 
-        countdown?.let { CountdownOverlay(it) }
+        val progress = burstProgress
+        if (progress != null) {
+            NightHoldOverlay(progress.done, progress.total)
+        } else {
+            countdown?.let { CountdownOverlay(it) }
+        }
         ShutterFlash(flashCount)
 
         ModeIndicator(
             simultaneous = status.simultaneous,
+            night = uiState.nightMode,
             lensCount = uiState.lensCount,
             modifier = Modifier.align(Alignment.TopStart).padding(12.dp)
         )
 
-        StereoIndicator(modifier = Modifier.align(Alignment.TopEnd).padding(12.dp))
+        NightToggle(
+            enabled = uiState.nightMode,
+            onToggle = { viewModel.setNightMode(context, !uiState.nightMode) },
+            modifier = Modifier.align(Alignment.TopEnd).padding(12.dp)
+        )
 
         ZoomPanel(
             uiState = uiState,
@@ -262,7 +273,7 @@ private fun CountdownOverlay(value: Int) {
 }
 
 @Composable
-private fun ModeIndicator(simultaneous: Boolean, lensCount: Int, modifier: Modifier = Modifier) {
+private fun ModeIndicator(simultaneous: Boolean, night: Boolean, lensCount: Int, modifier: Modifier = Modifier) {
     Box(
         modifier = modifier
             .background(WiggleColors.OverlayStrong, RoundedCornerShape(12.dp))
@@ -277,7 +288,8 @@ private fun ModeIndicator(simultaneous: Boolean, lensCount: Int, modifier: Modif
             )
             Spacer(modifier = Modifier.width(8.dp))
             Text(
-                text = if (simultaneous) "SIMULTAN (2 Linsen)" else "SEQUENTIELL ($lensCount Linsen)",
+                text = (if (simultaneous) "SIMULTAN (2 Linsen)" else "SEQUENTIELL ($lensCount Linsen)") +
+                    if (night) " · NACHT" else "",
                 fontSize = 11.sp,
                 fontWeight = FontWeight.Black,
                 color = WiggleColors.TextPrimary,
@@ -288,15 +300,52 @@ private fun ModeIndicator(simultaneous: Boolean, lensCount: Int, modifier: Modif
 }
 
 @Composable
-private fun StereoIndicator(modifier: Modifier = Modifier) {
+private fun NightToggle(enabled: Boolean, onToggle: () -> Unit, modifier: Modifier = Modifier) {
     Box(
         modifier = modifier
-            .background(WiggleColors.Overlay, RoundedCornerShape(8.dp))
-            .padding(horizontal = 8.dp, vertical = 4.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(if (enabled) WiggleColors.Accent else WiggleColors.OverlayStrong)
+            .border(1.dp, if (enabled) WiggleColors.Accent else WiggleColors.Outline, RoundedCornerShape(12.dp))
+            .clickable(onClick = onToggle)
+            .padding(horizontal = 12.dp, vertical = 8.dp)
     ) {
-        Column(horizontalAlignment = Alignment.End) {
-            Text("STEREO ACTIVE", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = WiggleColors.Accent)
-            Text("Kamera live", fontSize = 8.sp, color = Color.LightGray)
+        Text(
+            text = if (enabled) "☾ NACHT AN" else "☾ NACHT",
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Black,
+            color = if (enabled) Color.Black else WiggleColors.TextPrimary,
+            letterSpacing = 0.5.sp
+        )
+    }
+}
+
+/** Shown while a night burst is being taken. */
+@Composable
+private fun NightHoldOverlay(done: Int, total: Int) {
+    Box(
+        modifier = Modifier.fillMaxSize().background(WiggleColors.Scrim),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(
+                text = "RUHIG HALTEN",
+                fontSize = 30.sp,
+                fontWeight = FontWeight.Black,
+                color = WiggleColors.TextPrimary
+            )
+            Spacer(modifier = Modifier.height(10.dp))
+            Text(
+                text = "Nachtaufnahme · Bild ${(done + 1).coerceAtMost(total)} von $total",
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+                color = WiggleColors.Accent
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = "Kleine Bewegungen gleicht die App aus",
+                fontSize = 12.sp,
+                color = WiggleColors.TextTertiary
+            )
         }
     }
 }

@@ -23,6 +23,7 @@ import android.view.Surface
 import androidx.annotation.RequiresApi
 import com.example.align.FrameMetadata
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicBoolean
@@ -52,6 +53,9 @@ class DualPhysicalSession(
         const val OPEN_TIMEOUT_MS = 4_000L
         const val CAPTURE_TIMEOUT_MS = 4_000L
         const val RESULT_GRACE_MS = 500L
+
+        /** Extra time allowed per additional frame of a night burst. */
+        const val BURST_FRAME_TIMEOUT_MS = 1_500L
     }
 
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -77,9 +81,20 @@ class DualPhysicalSession(
     @Volatile
     private var pending: PendingCapture? = null
 
-    private class PendingCapture {
-        val a = CompletableDeferred<ByteArray>()
-        val b = CompletableDeferred<ByteArray>()
+    /** Collects the JPEGs of one (burst) capture as they arrive from both readers. */
+    private class PendingCapture(val count: Int, val onProgress: (Int) -> Unit) {
+        val a = ArrayList<ByteArray>(count)
+        val b = ArrayList<ByteArray>(count)
+        val done = CompletableDeferred<Unit>()
+
+        @Synchronized
+        fun add(isA: Boolean, bytes: ByteArray) {
+            val list = if (isA) a else b
+            if (list.size >= count) return
+            list += bytes
+            onProgress(minOf(a.size, b.size))
+            if (a.size >= count && b.size >= count) done.complete(Unit)
+        }
     }
 
     init {
@@ -95,24 +110,29 @@ class DualPhysicalSession(
         val sizeB = jpegSize(physicalIdB ?: logicalCameraId, is4K)
         Log.d(TAG, "JPEG sizes A=${sizeA.width}x${sizeA.height} B=${sizeB.width}x${sizeB.height}")
 
-        readerA = ImageReader.newInstance(sizeA.width, sizeA.height, ImageFormat.JPEG, 2)
-        readerB = ImageReader.newInstance(sizeB.width, sizeB.height, ImageFormat.JPEG, 2)
+        // Three buffers: a burst keeps the HAL busy while earlier JPEGs are still being copied.
+        readerA = ImageReader.newInstance(sizeA.width, sizeA.height, ImageFormat.JPEG, 3)
+        readerB = ImageReader.newInstance(sizeB.width, sizeB.height, ImageFormat.JPEG, 3)
         readerA.setOnImageAvailableListener({ reader -> drain(reader, isA = true) }, backgroundHandler)
         readerB.setOnImageAvailableListener({ reader -> drain(reader, isA = false) }, backgroundHandler)
     }
 
     private fun drain(reader: ImageReader, isA: Boolean) {
-        val image = runCatching { reader.acquireLatestImage() }.getOrNull() ?: return
-        try {
-            val target = pending ?: return
-            val buffer = image.planes[0].buffer
-            val bytes = ByteArray(buffer.remaining())
-            buffer.get(bytes)
-            if (isA) target.a.complete(bytes) else target.b.complete(bytes)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed reading image", e)
-        } finally {
-            runCatching { image.close() }
+        // acquireNextImage, not acquireLatestImage: during a burst several JPEGs can be queued
+        // and every one of them is needed.
+        while (true) {
+            val image = runCatching { reader.acquireNextImage() }.getOrNull() ?: return
+            try {
+                val target = pending ?: continue
+                val buffer = image.planes[0].buffer
+                val bytes = ByteArray(buffer.remaining())
+                buffer.get(bytes)
+                target.add(isA, bytes)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed reading image", e)
+            } finally {
+                runCatching { image.close() }
+            }
         }
     }
 
@@ -316,55 +336,69 @@ class DualPhysicalSession(
      * Triggers one synchronised still capture. Returns null on failure or timeout; it never
      * suspends indefinitely.
      */
-    suspend fun capture(): DualCapture? {
-        if (closed) return null
+    suspend fun capture(): DualCapture? = captureBurst(1)?.firstOrNull()
+
+    /**
+     * Takes [count] synchronised still pairs back to back (night mode). Exposure and white
+     * balance are locked for the burst so all frames can be averaged. [onProgress] reports
+     * how many complete pairs have arrived. Returns null on failure or timeout.
+     */
+    suspend fun captureBurst(count: Int, onProgress: (Int) -> Unit = {}): List<DualCapture>? {
+        if (closed || count < 1) return null
         val camera = device ?: return null
         val captureSession = session ?: return null
 
-        val request = PendingCapture()
+        val request = PendingCapture(count, onProgress)
         pending = request
-        val result = CompletableDeferred<TotalCaptureResult?>()
+        val results = arrayOfNulls<TotalCaptureResult>(count)
         try {
-            val builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
-                addTarget(readerA.surface)
-                addTarget(readerB.surface)
-                set(CaptureRequest.JPEG_QUALITY, 95.toByte())
-                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    set(CaptureRequest.CONTROL_ZOOM_RATIO, minZoomRatio)
+            val requests = (0 until count).map { index ->
+                camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                    addTarget(readerA.surface)
+                    addTarget(readerB.surface)
+                    set(CaptureRequest.JPEG_QUALITY, 95.toByte())
+                    set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                    if (count > 1) {
+                        set(CaptureRequest.CONTROL_AE_LOCK, true)
+                        set(CaptureRequest.CONTROL_AWB_LOCK, true)
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        set(CaptureRequest.CONTROL_ZOOM_RATIO, minZoomRatio)
+                    }
+                    setTag(index)
+                }.build()
+            }
+            val callback = object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, total: TotalCaptureResult) {
+                    (r.tag as? Int)?.let { if (it in 0 until count) results[it] = total }
+                }
+
+                override fun onCaptureFailed(s: CameraCaptureSession, r: CaptureRequest, failure: CaptureFailure) {
+                    Log.e(TAG, "Still capture ${r.tag} failed, reason ${failure.reason}")
+                    request.done.completeExceptionally(IllegalStateException("capture failed"))
                 }
             }
-            captureSession.capture(
-                builder.build(),
-                object : CameraCaptureSession.CaptureCallback() {
-                    override fun onCaptureCompleted(
-                        s: CameraCaptureSession,
-                        r: CaptureRequest,
-                        total: TotalCaptureResult
-                    ) {
-                        result.complete(total)
-                    }
+            if (count == 1) {
+                captureSession.capture(requests.first(), callback, backgroundHandler)
+            } else {
+                captureSession.captureBurst(requests, callback, backgroundHandler)
+            }
 
-                    override fun onCaptureFailed(
-                        s: CameraCaptureSession,
-                        r: CaptureRequest,
-                        failure: CaptureFailure
-                    ) {
-                        Log.e(TAG, "Still capture failed, reason ${failure.reason}")
-                        result.complete(null)
-                        request.a.completeExceptionally(IllegalStateException("capture failed"))
-                        request.b.completeExceptionally(IllegalStateException("capture failed"))
+            return withTimeoutOrNull(CAPTURE_TIMEOUT_MS + (count - 1) * BURST_FRAME_TIMEOUT_MS) {
+                request.done.await()
+                // Results normally arrive before the JPEGs; never wait long for them.
+                withTimeoutOrNull(RESULT_GRACE_MS) { while (results.any { it == null }) delay(20) }
+                synchronized(request) {
+                    (0 until count).map { i ->
+                        val total = results[i]
+                        DualCapture(
+                            request.a[i],
+                            request.b[i],
+                            total?.let { metadataFor(it, physicalIdA) },
+                            total?.let { metadataFor(it, physicalIdB) }
+                        )
                     }
-                },
-                backgroundHandler
-            )
-
-            return withTimeoutOrNull(CAPTURE_TIMEOUT_MS) {
-                val a = request.a.await()
-                val b = request.b.await()
-                // The result normally arrives before the JPEGs; never wait long for it.
-                val total = withTimeoutOrNull(RESULT_GRACE_MS) { result.await() }
-                DualCapture(a, b, total?.let { metadataFor(it, physicalIdA) }, total?.let { metadataFor(it, physicalIdB) })
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Still capture threw", e)
@@ -390,10 +424,7 @@ class DualPhysicalSession(
     fun close() {
         if (closed) return
         closed = true
-        pending?.let {
-            it.a.cancel()
-            it.b.cancel()
-        }
+        pending?.done?.cancel()
         pending = null
         runCatching { session?.close() }
         session = null

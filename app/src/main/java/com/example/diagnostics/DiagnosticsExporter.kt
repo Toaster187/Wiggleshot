@@ -89,10 +89,16 @@ object DiagnosticsExporter {
         capture.frames.forEachIndexed { index, frame ->
             val fileName = "frame_${index}_lens_${frame.lens.id}.jpg"
             val saved = folder.write(fileName, "image/jpeg", frame.bytes)
+            // Night mode burst: the further frames of this lens.
+            val burstFiles = frame.allBytes.drop(1).mapIndexedNotNull { k, bytes ->
+                val name = "frame_${index}_lens_${frame.lens.id}_burst${k + 1}.jpg"
+                if (folder.write(name, "image/jpeg", bytes)) name else null
+            }
             framesJson.put(
                 JSONObject()
                     .put("index", index)
                     .put("file", if (saved) fileName else JSONObject.NULL)
+                    .put("burstFiles", JSONArray(burstFiles))
                     .put("lensId", frame.lens.id)
                     .put("lensName", frame.lens.name)
                     .put("logicalId", frame.lens.logicalId)

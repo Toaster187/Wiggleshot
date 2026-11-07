@@ -7,6 +7,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import android.os.Build
+import com.example.align.BurstMerger
 import com.example.align.WiggleAligner
 import com.example.camera.CameraLensDetails
 import com.example.camera.CapturedFrame
@@ -63,6 +64,8 @@ data class WiggleUiState(
     val diagnosticsStatus: String? = null,
     /** Captures waiting for or in background alignment. The shutter stays usable meanwhile. */
     val pendingJobs: Int = 0,
+    /** Night mode: several frames per lens, aligned and averaged (hold still ~1 s). */
+    val nightMode: Boolean = false,
     val pivot: WiggleAligner.Pivot = WiggleAligner.Pivot.CENTER,
     val denoise: WiggleAligner.Denoise = WiggleAligner.Denoise.AUTO,
     /** True once a capture has been taken that "export last capture" can write out. */
@@ -93,6 +96,12 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
 
         /** Raw captures (encoded JPEGs, a few MB each) that may wait for alignment. */
         const val MAX_PENDING_JOBS = 6
+
+        /** Frames per lens in night mode (noise drops by up to √5 ≈ 2.2x). */
+        const val NIGHT_FRAMES = 5
+
+        /** Encoded bytes allowed to wait in the queue (a night capture is ~50 MB). */
+        const val MAX_PENDING_BYTES = 160L * 1024 * 1024
     }
 
     val capturesList: StateFlow<List<WiggleCapture>> = repository.allCaptures
@@ -134,6 +143,7 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
                     .getOrDefault(WiggleAligner.Pivot.CENTER)
                 val savedDenoise = runCatching { WiggleAligner.Denoise.valueOf(SettingsManager.getDenoise(context)) }
                     .getOrDefault(WiggleAligner.Denoise.AUTO)
+                val savedNight = SettingsManager.getNightMode(context)
 
                 val primary = lenses.firstOrNull { it.id == savedPrimaryId }
                     ?: lenses.firstOrNull { !it.isDefaultUltraWide && it.isPhysical }
@@ -165,6 +175,7 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
                         diagnosticsMode = savedDiagnostics,
                         pivot = savedPivot,
                         denoise = savedDenoise,
+                        nightMode = savedNight,
                         concurrentPreviewSupported = discovery.concurrentPreviewSupported,
                         previewStateMessage = if (discovery.concurrentPreviewSupported) {
                             "Dual Cameras Active"
@@ -298,6 +309,7 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
                     Log.e(TAG, "Error processing capture", e)
                     _uiState.update { it.copy(message = "Verarbeitung fehlgeschlagen") }
                 } finally {
+                    pendingBytes.addAndGet(-job.capture.encodedSize)
                     _uiState.update {
                         it.copy(
                             pendingJobs = (it.pendingJobs - 1).coerceAtLeast(0),
@@ -309,19 +321,55 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
         }
     }
 
+    private val pendingBytes = java.util.concurrent.atomic.AtomicLong(0)
+
     private fun enqueue(job: Job): Boolean {
         if (job.capture.frames.size < 2) {
             _uiState.update { it.copy(message = "Nur ${job.capture.frames.size} Frame erfasst – Aufnahme verworfen") }
             return false
         }
+        val size = job.capture.encodedSize
+        if (pendingBytes.get() > 0 && pendingBytes.get() + size > MAX_PENDING_BYTES) {
+            _uiState.update { it.copy(message = "Noch Aufnahmen in Bearbeitung – kurz warten") }
+            return false
+        }
+        pendingBytes.addAndGet(size)
         _uiState.update { it.copy(pendingJobs = it.pendingJobs + 1) }
         val queued = jobs.trySend(job).isSuccess
         if (!queued) {
+            pendingBytes.addAndGet(-size)
             _uiState.update {
                 it.copy(pendingJobs = it.pendingJobs - 1, message = "Noch ${MAX_PENDING_JOBS} Aufnahmen in Bearbeitung – kurz warten")
             }
         }
         return queued
+    }
+
+    /**
+     * Night mode: merges the burst of every lens into one frame. The same burst index is the
+     * reference for all lenses (the sharpest main frame), so the merged frames still show
+     * one instant and the lens alignment stays valid.
+     */
+    private fun mergeBurst(capture: RawCapture): Pair<List<CapturedFrame>, String>? {
+        val primary = capture.frames.first()
+        val reference = (0 until primary.frameCount).maxByOrNull { index ->
+            primary.decodePreview(index, 8)?.let { preview ->
+                BurstMerger.sharpness(preview).also { preview.recycle() }
+            } ?: -1.0
+        } ?: 0
+        val notes = mutableListOf<String>()
+        val frames = capture.frames.mapNotNull { raw ->
+            val reference0 = reference.coerceAtMost(raw.frameCount - 1)
+            val merged = BurstMerger().merge(raw.frameCount, reference0) { raw.decode(it)?.bitmap } ?: return@mapNotNull null
+            Log.d(TAG, "Night merge lens ${raw.lens.id}: $merged")
+            notes += "${raw.lens.name.substringAfterLast("- ").substringBefore(" (")}: ${merged.used}/${merged.total}"
+            CapturedFrame(raw.lens, merged.bitmap, raw.rotationDegrees, raw.appliedZoom, raw.metadata, raw.allBytes[reference0])
+        }
+        if (frames.size < 2) {
+            frames.forEach { it.bitmap.recycle() }
+            return null
+        }
+        return frames to "Nacht: " + notes.joinToString(" · ") + " Bilder"
     }
 
     private fun decode(capture: RawCapture): List<CapturedFrame>? {
@@ -375,7 +423,15 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
 
     private suspend fun runCapture(job: Job) {
         val context = job.context
-        val frames = decode(job.capture) ?: return
+        var nightNote: String? = null
+        val frames = if (job.capture.isBurst) {
+            mergeBurst(job.capture)?.let { (merged, note) ->
+                nightNote = note
+                merged
+            } ?: decode(job.capture)
+        } else {
+            decode(job.capture)
+        } ?: return
         val state = _uiState.value
         val output = aligner(context).process(
             frames = frames,
@@ -393,7 +449,7 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
         if (state.diagnosticsMode) {
             DiagnosticsExporter.saveCapture(context, job.capture, output.reports)
         }
-        val info = output.reports.joinToString("\n") { it.summary() }.ifEmpty { null }
+        val info = (output.reports.map { it.summary() } + listOfNotNull(nightNote)).joinToString("\n").ifEmpty { null }
         val uncertain = state.autoAlign && output.reports.any { it.uncertain }
         _uiState.update {
             it.copy(
@@ -423,6 +479,19 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
             _uiState.update { it.copy(diagnosticsBusy = false, diagnosticsStatus = text, message = text) }
         }
     }
+
+    fun setNightMode(context: Context, enabled: Boolean) {
+        SettingsManager.saveNightMode(context, enabled)
+        _uiState.update {
+            it.copy(
+                nightMode = enabled,
+                message = if (enabled) "Nachtmodus: beim Auslösen ~1 s ruhig halten" else null
+            )
+        }
+    }
+
+    /** Frames per lens for the next capture. */
+    fun burstFrames(): Int = if (_uiState.value.nightMode) NIGHT_FRAMES else 1
 
     fun setDenoise(context: Context, denoise: WiggleAligner.Denoise) {
         SettingsManager.saveDenoise(context, denoise.name)

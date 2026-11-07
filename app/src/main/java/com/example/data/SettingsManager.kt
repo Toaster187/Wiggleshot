@@ -15,6 +15,7 @@ object SettingsManager {
     private const val KEY_DIAGNOSTICS = "diagnostics_mode"
     private const val KEY_PIVOT = "pivot"
     private const val KEY_DENOISE = "denoise_secondary"
+    private const val KEY_NIGHT = "night_mode"
 
     private const val TAG = "SettingsManager"
 
@@ -50,6 +51,10 @@ object SettingsManager {
     fun getDenoise(context: Context): String = prefs(context).getString(KEY_DENOISE, "AUTO") ?: "AUTO"
 
     fun saveDenoise(context: Context, value: String) = prefs(context).edit().putString(KEY_DENOISE, value).apply()
+
+    fun getNightMode(context: Context): Boolean = prefs(context).getBoolean(KEY_NIGHT, false)
+
+    fun saveNightMode(context: Context, value: Boolean) = prefs(context).edit().putBoolean(KEY_NIGHT, value).apply()
 
     private fun prefs(context: Context) = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 

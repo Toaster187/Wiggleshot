@@ -73,6 +73,9 @@ class CameraController(context: Context) {
 
         private const val PREVIEW_SETTLE_MS = 220L
         private const val SEQUENTIAL_SETTLE_MS = 140L
+
+        /** Upper bound of frames per lens in night mode. */
+        const val MAX_BURST = 8
     }
 
     enum class Mode {
@@ -136,6 +139,12 @@ class CameraController(context: Context) {
 
     /** Non-null while a sequential capture is running and the device should be held still. */
     val countdown: StateFlow<Int?> = _countdown.asStateFlow()
+
+    /** Progress of a night mode burst: (frames done, frames total), null when idle. */
+    data class BurstProgress(val done: Int, val total: Int)
+
+    private val _burstProgress = MutableStateFlow<BurstProgress?>(null)
+    val burstProgress: StateFlow<BurstProgress?> = _burstProgress.asStateFlow()
 
     /** Serialises configuration against capture. */
     private val lock = Mutex()
@@ -399,7 +408,12 @@ class CameraController(context: Context) {
      * was ignored because another capture or a reconfiguration is running. The whole
      * operation is time boxed, so the shutter can never stay stuck.
      */
-    suspend fun capture(request: Request, zoomFor: (CameraLensDetails) -> Float): RawCapture? {
+    suspend fun capture(
+        request: Request,
+        /** Frames per lens; more than one is night mode (hold still, frames are averaged). */
+        burst: Int = 1,
+        zoomFor: (CameraLensDetails) -> Float
+    ): RawCapture? {
         if (!lock.tryLock()) {
             Log.d(TAG, "Capture ignored, camera busy")
             return null
@@ -407,12 +421,15 @@ class CameraController(context: Context) {
         var needsReconfigure = false
         return try {
             _status.value = _status.value.copy(busy = true)
-            withTimeoutOrNull(CAPTURE_TIMEOUT_BASE_MS + request.lenses.size * CAPTURE_TIMEOUT_PER_LENS_MS) {
-                captureDual(request)?.let { RawCapture(it, simultaneous = true) }
-                    ?: capturePair(request, zoomFor)?.let { RawCapture(it, simultaneous = true) }
+            val frames = burst.coerceIn(1, MAX_BURST)
+            if (frames > 1) _burstProgress.value = BurstProgress(0, frames)
+            val timeout = CAPTURE_TIMEOUT_BASE_MS + request.lenses.size * CAPTURE_TIMEOUT_PER_LENS_MS * frames
+            withTimeoutOrNull(timeout) {
+                captureDual(request, frames)?.let { RawCapture(it, simultaneous = true) }
+                    ?: capturePair(request, zoomFor, frames)?.let { RawCapture(it, simultaneous = true) }
                     ?: run {
                         needsReconfigure = true
-                        RawCapture(captureSequential(request, zoomFor), simultaneous = false)
+                        RawCapture(captureSequential(request, zoomFor, frames), simultaneous = false)
                     }
             } ?: RawCapture(emptyList(), simultaneous = false)
         } catch (e: Exception) {
@@ -420,6 +437,7 @@ class CameraController(context: Context) {
             RawCapture(emptyList(), simultaneous = false)
         } finally {
             _countdown.value = null
+            _burstProgress.value = null
             _status.value = _status.value.copy(busy = false)
             lock.unlock()
             // Sequential capture unbinds every use case; rebuild the live preview.
@@ -427,33 +445,42 @@ class CameraController(context: Context) {
         }
     }
 
-    private suspend fun captureDual(request: Request): List<RawFrame>? {
+    private suspend fun captureDual(request: Request, burst: Int): List<RawFrame>? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
         val session = dualSession ?: return null
         val secondary = request.secondaries.singleOrNull() ?: return null
-        val pair = session.capture() ?: run {
+        val pairs = session.captureBurst(burst) { done ->
+            if (burst > 1) _burstProgress.value = BurstProgress(done, burst)
+        }
+        if (pairs.isNullOrEmpty()) {
             Log.w(TAG, "Dual capture returned nothing, falling back")
             return null
         }
+        val rotationA = session.sensorOrientationOf(request.primary.id)
+        val rotationB = session.sensorOrientationOf(secondary.id)
+        val first = pairs.first()
         return listOf(
             RawFrame(
                 request.primary,
-                CameraImages.Jpeg(pair.jpegA, session.sensorOrientationOf(request.primary.id)),
+                CameraImages.Jpeg(first.jpegA, rotationA),
                 1f,
-                pair.metadataA
+                first.metadataA,
+                pairs.drop(1).map { CameraImages.Jpeg(it.jpegA, rotationA) }
             ),
             RawFrame(
                 secondary,
-                CameraImages.Jpeg(pair.jpegB, session.sensorOrientationOf(secondary.id)),
+                CameraImages.Jpeg(first.jpegB, rotationB),
                 1f,
-                pair.metadataB
+                first.metadataB,
+                pairs.drop(1).map { CameraImages.Jpeg(it.jpegB, rotationB) }
             )
         )
     }
 
     private suspend fun capturePair(
         request: Request,
-        zoomFor: (CameraLensDetails) -> Float
+        zoomFor: (CameraLensDetails) -> Float,
+        burst: Int
     ): List<RawFrame>? {
         val a = captureA ?: return null
         val b = captureB ?: return null
@@ -463,15 +490,29 @@ class CameraController(context: Context) {
         val zoomB = zoomFor(secondary)
         applyZoom(zoomA, zoomB)
 
-        val jpegs = coroutineScope {
-            listOf(
-                async { a.captureJpeg(imageExecutor) },
-                async { b.captureJpeg(imageExecutor) }
-            ).awaitAll()
+        val primaryJpegs = mutableListOf<CameraImages.Jpeg>()
+        val secondaryJpegs = mutableListOf<CameraImages.Jpeg>()
+        repeat(burst) { index ->
+            val jpegs = coroutineScope {
+                listOf(
+                    async { a.captureJpeg(imageExecutor) },
+                    async { b.captureJpeg(imageExecutor) }
+                ).awaitAll()
+            }
+            val first = jpegs[0]
+            val second = jpegs[1]
+            if (first == null || second == null) {
+                if (index == 0) return null
+            } else {
+                primaryJpegs += first
+                secondaryJpegs += second
+            }
+            if (burst > 1) _burstProgress.value = BurstProgress(index + 1, burst)
         }
-        val first = jpegs[0] ?: return null
-        val second = jpegs[1] ?: return null
-        return listOf(RawFrame(request.primary, first, zoomA), RawFrame(secondary, second, zoomB))
+        return listOf(
+            RawFrame(request.primary, primaryJpegs.first(), zoomA, null, primaryJpegs.drop(1)),
+            RawFrame(secondary, secondaryJpegs.first(), zoomB, null, secondaryJpegs.drop(1))
+        )
     }
 
     /**
@@ -481,20 +522,26 @@ class CameraController(context: Context) {
      */
     private suspend fun captureSequential(
         request: Request,
-        zoomFor: (CameraLensDetails) -> Float
+        zoomFor: (CameraLensDetails) -> Float,
+        burst: Int
     ): List<RawFrame> {
         _countdown.value = 0
 
         val frames = mutableListOf<RawFrame>()
+        var done = 0
         request.lenses.forEachIndexed { index, lens ->
             val zoom = zoomFor(lens)
-            val jpeg = if (index == 0) {
-                captureFromLiveCamera(lens, zoom) ?: captureStillFrame(lens, zoom, request.is4K, PREVIEW_SETTLE_MS)
-            } else {
-                captureStillFrame(lens, zoom, request.is4K, SEQUENTIAL_SETTLE_MS)
+            val jpegs = mutableListOf<CameraImages.Jpeg>()
+            if (index == 0) {
+                repeat(burst) { captureFromLiveCamera(lens, zoom)?.let { jpegs += it } }
             }
-            if (jpeg != null) {
-                frames += RawFrame(lens, jpeg, zoom)
+            if (jpegs.isEmpty()) {
+                jpegs += captureStillFrames(lens, zoom, request.is4K, if (index == 0) PREVIEW_SETTLE_MS else SEQUENTIAL_SETTLE_MS, burst)
+            }
+            done += 1
+            if (burst > 1) _burstProgress.value = BurstProgress(done * burst / request.lenses.size, burst)
+            if (jpegs.isNotEmpty()) {
+                frames += RawFrame(lens, jpegs.first(), zoom, null, jpegs.drop(1))
             } else {
                 Log.e(TAG, "No frame captured for lens ${lens.id}")
             }
@@ -512,17 +559,18 @@ class CameraController(context: Context) {
 
     /**
      * Binds [lens] on its own, waits for auto exposure and white balance to settle and takes
-     * a single frame. Used for the second and further lenses of a sequential capture.
+     * [count] frames. Used for the second and further lenses of a sequential capture.
      */
-    private suspend fun captureStillFrame(
+    private suspend fun captureStillFrames(
         lens: CameraLensDetails,
         zoom: Float,
         is4K: Boolean,
-        settleDelayMs: Long
-    ): CameraImages.Jpeg? {
-        val owner = lifecycleOwner ?: return null
-        val views = views ?: return null
-        val provider = obtainProvider() ?: return null
+        settleDelayMs: Long,
+        count: Int
+    ): List<CameraImages.Jpeg> {
+        val owner = lifecycleOwner ?: return emptyList()
+        val views = views ?: return emptyList()
+        val provider = obtainProvider() ?: return emptyList()
 
         return try {
             provider.unbindAll()
@@ -549,10 +597,10 @@ class CameraController(context: Context) {
                 Log.w(TAG, "3A did not converge for lens ${lens.id}, capturing anyway")
             }
             delay(settleDelayMs)
-            imageCapture.captureJpeg(imageExecutor)
+            (0 until count).mapNotNull { imageCapture.captureJpeg(imageExecutor) }
         } catch (e: Exception) {
             Log.e(TAG, "Still frame capture failed for lens ${lens.id}", e)
-            null
+            emptyList()
         }
     }
 

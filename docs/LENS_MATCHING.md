@@ -56,6 +56,16 @@ vergleichen.
   Gemessen auf der Testaufnahme: Fleckenrauschen 1,21 → 0,61 (Hauptkamera 0,46),
   Farbrauschen 0,14 → 0,05 (Hauptkamera 0,04). Einstellung „Rauschfilter 0,5×“.
   Mehrbild-Rauschreduzierung (Burst + Mittelung) wäre der nächste Schritt.
+- **Nachtmodus (☾ oben rechts):** pro Auslösen 5 gleichzeitige Bildpaare in einem Burst
+  (Belichtung und Weißabgleich gesperrt, Dauer im Dunkeln ~0,5–1 s). Pro Linse wird jedes
+  Bild auf das schärfste Bild der Serie ausgerichtet (Verschiebung, Rotation, Focus
+  Breathing – niemand hält millimetergenau still) und robust gemittelt: wo ein Bild nach der
+  Ausrichtung deutlich abweicht (Bewegung, Fernseher, Parallaxe durch Handbewegung), zählt
+  es dort nicht, so entstehen keine Geisterbilder (`BurstMerger`). Für alle Linsen wird
+  dasselbe Burst-Bild als Referenz genommen, damit die Wiggle-Bilder weiter denselben
+  Moment zeigen. Synthetischer Test mit Handzittern (bis 9 px, 0,2°) und einem bewegten
+  Objekt: Rauschen 9,0 → 3,2, kein Geist. Die Verarbeitung dauert länger und läuft im
+  Hintergrund.
 - **Kalibrierung pro Auflösung:** Der HD-Stream der 0,5× hat ein anderes Bildfeld als der
   4K-Stream (1,68× statt 2,32× Vergrößerung); Kalibrierungen werden daher pro Streamgröße
   gespeichert.

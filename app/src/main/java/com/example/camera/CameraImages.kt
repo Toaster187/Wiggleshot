@@ -87,6 +87,21 @@ internal object CameraImages {
         null
     }
 
+    /**
+     * Fast, subsampled decode (no crop) of [jpeg], rotated upright; used to rank burst frames
+     * by sharpness.
+     */
+    fun decodeSampled(jpeg: Jpeg, sampleSize: Int): Bitmap? = try {
+        val options = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+        BitmapFactory.decodeByteArray(jpeg.bytes, 0, jpeg.bytes.size, options)?.let { decoded ->
+            val matrix = Matrix().apply { postRotate(jpeg.rotationDegrees.toFloat()) }
+            createBitmapSafely(decoded, 0, 0, decoded.width, decoded.height, matrix)
+        }
+    } catch (e: Exception) {
+        Log.e(TAG, "Failed decoding preview", e)
+        null
+    }
+
     /** Decodes a raw JPEG from the Camera2 path and rotates it upright. */
     fun fromJpeg(bytes: ByteArray, rotationDegrees: Int): Bitmap? = decode(bytes, rotationDegrees)
 
