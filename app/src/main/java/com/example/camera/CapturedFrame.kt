@@ -73,6 +73,9 @@ class RawCapture(
     val simultaneous: Boolean,
     val timestamp: Long = System.currentTimeMillis()
 ) {
+    /** How long the night burst took, i.e. how long the user had to hold still. */
+    var burstDurationMs: Long = 0
+
     /** Night mode burst (more than one frame per lens). */
     val isBurst: Boolean get() = frames.any { it.frameCount > 1 }
 

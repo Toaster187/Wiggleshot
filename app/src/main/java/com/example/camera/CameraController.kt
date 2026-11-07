@@ -5,6 +5,7 @@ import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.os.Build
+import android.os.SystemClock
 import android.util.Log
 import android.util.Size
 import android.view.Surface
@@ -76,6 +77,9 @@ class CameraController(context: Context) {
 
         /** Upper bound of frames per lens in night mode. */
         const val MAX_BURST = 8
+
+        /** Start value for the hold-still estimate until a burst has been measured. */
+        private const val DEFAULT_MS_PER_FRAME = 220.0
     }
 
     enum class Mode {
@@ -140,8 +144,22 @@ class CameraController(context: Context) {
     /** Non-null while a sequential capture is running and the device should be held still. */
     val countdown: StateFlow<Int?> = _countdown.asStateFlow()
 
-    /** Progress of a night mode burst: (frames done, frames total), null when idle. */
-    data class BurstProgress(val done: Int, val total: Int)
+    /**
+     * Progress of a night mode burst, null when idle. [startedAt] (elapsedRealtime) and
+     * [estimatedMs] let the UI animate how long the user still has to hold still.
+     */
+    data class BurstProgress(val done: Int, val total: Int, val startedAt: Long, val estimatedMs: Long)
+
+    /** Measured time per burst frame (moving average), used for the hold-still estimate. */
+    @Volatile
+    private var msPerFrame = DEFAULT_MS_PER_FRAME
+
+    /** How long a night burst of [frames] frames is expected to take. */
+    fun estimatedBurstMs(frames: Int): Long = (msPerFrame * frames).toLong()
+
+    private fun reportBurst(done: Int) {
+        _burstProgress.value = _burstProgress.value?.copy(done = done)
+    }
 
     private val _burstProgress = MutableStateFlow<BurstProgress?>(null)
     val burstProgress: StateFlow<BurstProgress?> = _burstProgress.asStateFlow()
@@ -422,7 +440,8 @@ class CameraController(context: Context) {
         return try {
             _status.value = _status.value.copy(busy = true)
             val frames = burst.coerceIn(1, MAX_BURST)
-            if (frames > 1) _burstProgress.value = BurstProgress(0, frames)
+            val burstStart = SystemClock.elapsedRealtime()
+            if (frames > 1) _burstProgress.value = BurstProgress(0, frames, burstStart, estimatedBurstMs(frames))
             val timeout = CAPTURE_TIMEOUT_BASE_MS + request.lenses.size * CAPTURE_TIMEOUT_PER_LENS_MS * frames
             withTimeoutOrNull(timeout) {
                 captureDual(request, frames)?.let { RawCapture(it, simultaneous = true) }
@@ -431,6 +450,12 @@ class CameraController(context: Context) {
                         needsReconfigure = true
                         RawCapture(captureSequential(request, zoomFor, frames), simultaneous = false)
                     }
+            }?.also { capture ->
+                if (frames > 1 && capture.frames.isNotEmpty()) {
+                    val elapsed = SystemClock.elapsedRealtime() - burstStart
+                    capture.burstDurationMs = elapsed
+                    msPerFrame = 0.6 * msPerFrame + 0.4 * (elapsed.toDouble() / frames)
+                }
             } ?: RawCapture(emptyList(), simultaneous = false)
         } catch (e: Exception) {
             Log.e(TAG, "Capture failed", e)
@@ -450,7 +475,7 @@ class CameraController(context: Context) {
         val session = dualSession ?: return null
         val secondary = request.secondaries.singleOrNull() ?: return null
         val pairs = session.captureBurst(burst) { done ->
-            if (burst > 1) _burstProgress.value = BurstProgress(done, burst)
+            if (burst > 1) reportBurst(done)
         }
         if (pairs.isNullOrEmpty()) {
             Log.w(TAG, "Dual capture returned nothing, falling back")
@@ -507,7 +532,7 @@ class CameraController(context: Context) {
                 primaryJpegs += first
                 secondaryJpegs += second
             }
-            if (burst > 1) _burstProgress.value = BurstProgress(index + 1, burst)
+            if (burst > 1) reportBurst(index + 1)
         }
         return listOf(
             RawFrame(request.primary, primaryJpegs.first(), zoomA, null, primaryJpegs.drop(1)),
@@ -539,7 +564,7 @@ class CameraController(context: Context) {
                 jpegs += captureStillFrames(lens, zoom, request.is4K, if (index == 0) PREVIEW_SETTLE_MS else SEQUENTIAL_SETTLE_MS, burst)
             }
             done += 1
-            if (burst > 1) _burstProgress.value = BurstProgress(done * burst / request.lenses.size, burst)
+            if (burst > 1) reportBurst(done * burst / request.lenses.size)
             if (jpegs.isNotEmpty()) {
                 frames += RawFrame(lens, jpegs.first(), zoom, null, jpegs.drop(1))
             } else {

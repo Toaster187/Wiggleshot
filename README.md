@@ -13,6 +13,8 @@ Wiggleshot is an Android app that lets you add animated wiggle effects to your p
 - Simultaneous dual-lens capture (e.g. Pixel 9: 1x + 0.5x) with automatic lens matching:
   scale, rotation, offset and colour of the 0.5x lens are measured on every shot so it lines
   up with the 1x lens — see [docs/LENS_MATCHING.md](./docs/LENS_MATCHING.md)
+- Night mode (aligned, motion-robust multi-frame merge) and a measured 3D-strength rating per
+  capture — tips for strong wiggles: [docs/3D_GUIDE.md](./docs/3D_GUIDE.md)
 - Diagnostics: raw frame / metadata export and a HAL zoom test that compares the matching
   with the one the Pixel camera pipeline uses itself
 

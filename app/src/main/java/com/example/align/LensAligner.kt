@@ -89,7 +89,12 @@ object LensAligner {
         val pivotShift: Double,
         val iterations: Int,
         val elapsedMs: Long,
-        val rectification: Rectification? = null
+        val rectification: Rectification? = null,
+        /**
+         * Parallax between near and far parts of the scene along the baseline (secondary px,
+         * 10th..90th percentile of the rectification patches), null if not measured.
+         */
+        val depthSpread: Double? = null
     ) {
         override fun toString(): String =
             "Result(global=$global, pivoted=$pivoted, conf=%.3f, prior=%s, coarse=%.3f, pivot=%.2fpx, it=$iterations, ${elapsedMs}ms)"
@@ -262,11 +267,12 @@ object LensAligner {
 
         // ---- 5. perpendicular rectification --------------------------------------------------
         val (nx, ny) = WarpField.normalOf(options.baselineX, options.baselineY)
-        val correction = if (options.rectify && pLevels.size >= 2) {
+        val rectifyOutcome = if (options.rectify && pLevels.size >= 2) {
             rectify(pNorm, sNorm, sGrad, global, nx, ny, options)
         } else {
             null
         }
+        val correction = rectifyOutcome?.correction
 
         val confidence = zncc(pNorm[0], sNorm[0], global)
         val priorConfidence = internalPrior?.let { zncc(pNorm[0], sNorm[0], it) }
@@ -299,6 +305,7 @@ object LensAligner {
         }
         return Result(
             rectification = rectification,
+            depthSpread = rectifyOutcome?.depthSpread?.let { it * sScale },
             global = globalOut,
             pivoted = pivotedOut,
             confidence = confidence,
@@ -610,7 +617,10 @@ object LensAligner {
 
     private class Correction(val coefficients: DoubleArray, val patches: Int, val rmsBefore: Double, val rmsAfter: Double)
 
-    private class PatchShift(val u: Double, val v: Double, val across: Double, val weight: Double)
+    private class PatchShift(val u: Double, val v: Double, val across: Double, val along: Double, val weight: Double)
+
+    /** Patch measurement result: the correction (if plausible) and the depth spread. */
+    private class RectifyOutcome(val correction: Correction?, val depthSpread: Double?, val patches: Int)
 
     /**
      * Measures the local displacement of a grid of patches relative to [global] and fits the
@@ -628,7 +638,7 @@ object LensAligner {
         nx: Double,
         ny: Double,
         options: Options
-    ): Correction? {
+    ): RectifyOutcome {
         val p0 = pNorm[0]
         val p1 = pNorm[1]
         val s1 = sNorm[1]
@@ -676,10 +686,19 @@ object LensAligner {
                 u = (cxp - p0.width / 2.0) / p0.width,
                 v = (cyp - p0.height / 2.0) / p0.width,
                 across = dx * nx + dy * ny,
+                along = dx * ex + dy * ey,
                 weight = 1.0 / (fit.second + 0.05)
             )
         }
-        if (shifts.size < MIN_RECTIFY_PATCHES) return null
+        if (shifts.size < MIN_RECTIFY_PATCHES) return RectifyOutcome(null, null, shifts.size)
+
+        // Depth spread: the parallax along the baseline between the nearest and the farthest
+        // parts of the scene (10th..90th percentile of the patches) — the strength of the 3D
+        // effect. It is measured before any correction, so it never depends on the field.
+        val alongSorted = shifts.map { it.along }.sorted()
+        val depthSpread = alongSorted[(alongSorted.size * 0.9).toInt().coerceAtMost(alongSorted.size - 1)] -
+            alongSorted[(alongSorted.size * 0.1).toInt()]
+        fun outcome(c: Correction?) = RectifyOutcome(c, depthSpread, shifts.size)
 
         // --- robust weighted least squares with a light ridge on the higher terms
         val n = WarpField.TERMS
@@ -699,7 +718,7 @@ object LensAligner {
             var trace = 0.0
             for (j in 0 until n) trace += h[j * n + j]
             for (j in 3 until n) h[j * n + j] += 1e-4 * trace / n
-            coefficients = solve(h, g, n) ?: return null
+            coefficients = solve(h, g, n) ?: return outcome(null)
             val residuals = shifts.map { sh ->
                 val b = WarpField.basis(sh.u, sh.v)
                 sh.across - (0 until n).sumOf { coefficients[it] * b[it] }
@@ -726,8 +745,8 @@ object LensAligner {
         // Only keep a correction that explains real structure and stays plausible.
         val field = WarpField(Similarity.IDENTITY, nx, ny, coefficients, p0.width.toDouble(), p0.height.toDouble())
         val limit = MAX_RECTIFY_FRACTION * sNorm[0].width.coerceAtLeast(p0.width)
-        if (field.maxOffset() > limit || rmsAfter > rmsBefore * 0.9) return null
-        return Correction(coefficients, shifts.size, rmsBefore, rmsAfter)
+        if (field.maxOffset() > limit || rmsAfter > rmsBefore * 0.9) return outcome(null)
+        return outcome(Correction(coefficients, shifts.size, rmsBefore, rmsAfter))
     }
 
     /**

@@ -13,6 +13,8 @@ import com.example.camera.CameraLensDetails
 import com.example.camera.CapturedFrame
 import com.example.camera.RawCapture
 import kotlinx.coroutines.channels.Channel
+import org.json.JSONArray
+import org.json.JSONObject
 import com.example.camera.LensDiscovery
 import com.example.data.SettingsManager
 import com.example.data.WiggleCapture
@@ -51,6 +53,7 @@ data class WiggleUiState(
     val isCalibrating: Boolean = false,
     val lensCount: Int = 2,
     val showSettings: Boolean = false,
+    val showGuide: Boolean = false,
     val is4K: Boolean = true,
     /** Secondary lenses are aligned automatically instead of using the manual zoom. */
     val autoAlign: Boolean = true,
@@ -295,6 +298,9 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
     @Volatile
     private var lastCapture: Pair<RawCapture, List<WiggleAligner.Report>>? = null
 
+    @Volatile
+    private var lastExtra: JSONObject? = null
+
     init {
         // One worker: captures are aligned strictly one after another, which bounds the
         // memory to one decoded capture no matter how fast the shutter is pressed.
@@ -350,7 +356,9 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
      * reference for all lenses (the sharpest main frame), so the merged frames still show
      * one instant and the lens alignment stays valid.
      */
-    private fun mergeBurst(capture: RawCapture): Pair<List<CapturedFrame>, String>? {
+    private class NightMerge(val frames: List<CapturedFrame>, val note: String, val details: JSONObject)
+
+    private fun mergeBurst(capture: RawCapture): NightMerge? {
         val primary = capture.frames.first()
         val reference = (0 until primary.frameCount).maxByOrNull { index ->
             primary.decodePreview(index, 8)?.let { preview ->
@@ -358,18 +366,32 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
             } ?: -1.0
         } ?: 0
         val notes = mutableListOf<String>()
+        val details = JSONArray()
         val frames = capture.frames.mapNotNull { raw ->
             val reference0 = reference.coerceAtMost(raw.frameCount - 1)
             val merged = BurstMerger().merge(raw.frameCount, reference0) { raw.decode(it)?.bitmap } ?: return@mapNotNull null
             Log.d(TAG, "Night merge lens ${raw.lens.id}: $merged")
             notes += "${raw.lens.name.substringAfterLast("- ").substringBefore(" (")}: ${merged.used}/${merged.total}"
+            details.put(
+                JSONObject()
+                    .put("lensId", raw.lens.id)
+                    .put("used", merged.used)
+                    .put("total", merged.total)
+                    .put("referenceIndex", merged.referenceIndex)
+                    .put("rejectedFraction", merged.rejectedFraction)
+                    .put("elapsedMs", merged.elapsedMs)
+            )
             CapturedFrame(raw.lens, merged.bitmap, raw.rotationDegrees, raw.appliedZoom, raw.metadata, raw.allBytes[reference0])
         }
         if (frames.size < 2) {
             frames.forEach { it.bitmap.recycle() }
             return null
         }
-        return frames to "Nacht: " + notes.joinToString(" · ") + " Bilder"
+        return NightMerge(
+            frames,
+            "Nacht: " + notes.joinToString(" · ") + " Bilder · ${capture.burstDurationMs} ms gehalten",
+            JSONObject().put("burstDurationMs", capture.burstDurationMs).put("lenses", details)
+        )
     }
 
     private fun decode(capture: RawCapture): List<CapturedFrame>? {
@@ -424,10 +446,12 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
     private suspend fun runCapture(job: Job) {
         val context = job.context
         var nightNote: String? = null
+        var nightDetails: JSONObject? = null
         val frames = if (job.capture.isBurst) {
-            mergeBurst(job.capture)?.let { (merged, note) ->
-                nightNote = note
-                merged
+            mergeBurst(job.capture)?.let { night ->
+                nightNote = night.note
+                nightDetails = night.details
+                night.frames
             } ?: decode(job.capture)
         } else {
             decode(job.capture)
@@ -446,18 +470,20 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
         )
         lastCapture = job.capture to output.reports
         _uiState.update { it.copy(hasLastCapture = true) }
+        lastExtra = nightDetails?.let { JSONObject().put("night", it) }
         if (state.diagnosticsMode) {
-            DiagnosticsExporter.saveCapture(context, job.capture, output.reports)
+            DiagnosticsExporter.saveCapture(context, job.capture, output.reports, extra = lastExtra)
         }
         val info = (output.reports.map { it.summary() } + listOfNotNull(nightNote)).joinToString("\n").ifEmpty { null }
         val uncertain = state.autoAlign && output.reports.any { it.uncertain }
+        val weakDepth = output.reports.firstNotNullOfOrNull { r -> r.depthRating?.tip }
         _uiState.update {
             it.copy(
                 alignmentInfo = info ?: it.alignmentInfo,
-                message = if (uncertain) {
-                    "Ausrichtung unsicher – zu wenig Details oder starke Bewegung. Gespeichert mit Kalibrierwerten."
-                } else {
-                    it.message
+                message = when {
+                    uncertain -> "Ausrichtung unsicher – zu wenig Details oder starke Bewegung. Gespeichert mit Kalibrierwerten."
+                    weakDepth != null -> weakDepth
+                    else -> it.message
                 }
             )
         }
@@ -473,7 +499,7 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
         viewModelScope.launch(Dispatchers.IO) {
             _uiState.update { it.copy(diagnosticsBusy = true, diagnosticsStatus = "Exportiere letzte Aufnahme …") }
             val path = runCatching {
-                DiagnosticsExporter.saveCapture(context, last.first, last.second, DiagnosticsExporter.newFolder(context, "capture"))
+                DiagnosticsExporter.saveCapture(context, last.first, last.second, DiagnosticsExporter.newFolder(context, "capture"), lastExtra)
             }.getOrNull()
             val text = path?.let { "Gespeichert in $it" } ?: "Export fehlgeschlagen"
             _uiState.update { it.copy(diagnosticsBusy = false, diagnosticsStatus = text, message = text) }
@@ -492,6 +518,9 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
 
     /** Frames per lens for the next capture. */
     fun burstFrames(): Int = if (_uiState.value.nightMode) NIGHT_FRAMES else 1
+
+    /** Frames per lens of a night capture. */
+    val nightFrames: Int get() = NIGHT_FRAMES
 
     fun setDenoise(context: Context, denoise: WiggleAligner.Denoise) {
         SettingsManager.saveDenoise(context, denoise.name)
@@ -540,8 +569,12 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
         }
     }
 
+    fun toggleGuide() {
+        _uiState.update { it.copy(showGuide = !it.showGuide, showSettings = false) }
+    }
+
     fun toggleSettings() {
-        _uiState.update { it.copy(showSettings = !it.showSettings) }
+        _uiState.update { it.copy(showSettings = !it.showSettings, showGuide = false) }
     }
 
     fun setLensCount(context: Context, count: Int) {

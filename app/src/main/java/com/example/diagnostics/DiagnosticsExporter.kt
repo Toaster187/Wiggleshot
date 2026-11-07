@@ -255,6 +255,7 @@ object DiagnosticsExporter {
                 .put("note", "secondary = base(p) + normal * sum(c_i * basis_i(u, v)); u=(x-w/2)/w, v=(y-h/2)/w; basis 1,u,v,u2,uv,v2,u3,u2v,uv2,v3")
         } ?: JSONObject.NULL)
         .put("rectifiedPatches", r.rectifiedPatches)
+        .put("depthPercent", toJson(r.depthPercent))
         .put("noiseSigma", toJson(r.noiseSigma))
         .put("speckPixels", r.speckPixels)
         .put("denoiseMs", r.denoiseMs)

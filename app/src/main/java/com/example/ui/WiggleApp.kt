@@ -19,6 +19,7 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.HelpOutline
 import androidx.compose.material.icons.filled.FilterFrames
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.Settings
@@ -81,9 +82,11 @@ fun WiggleApp(viewModel: WiggleViewModel) {
                 .padding(innerPadding)
                 .background(WiggleColors.Background)
         ) {
-            HeaderBar(onOpenSettings = viewModel::toggleSettings)
+            HeaderBar(onOpenSettings = viewModel::toggleSettings, onOpenGuide = viewModel::toggleGuide)
 
             when {
+                uiState.showGuide -> GuideScreen(onBack = viewModel::toggleGuide)
+
                 uiState.showSettings -> SettingsScreen(
                     viewModel = viewModel,
                     onBack = viewModel::toggleSettings
@@ -158,7 +161,7 @@ fun WiggleApp(viewModel: WiggleViewModel) {
 }
 
 @Composable
-private fun HeaderBar(onOpenSettings: () -> Unit) {
+private fun HeaderBar(onOpenSettings: () -> Unit, onOpenGuide: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -184,6 +187,19 @@ private fun HeaderBar(onOpenSettings: () -> Unit) {
             )
         }
 
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        IconButton(
+            onClick = onOpenGuide,
+            modifier = Modifier
+                .background(WiggleColors.SurfaceElevated, RoundedCornerShape(12.dp))
+                .size(44.dp)
+        ) {
+            Icon(
+                imageVector = Icons.AutoMirrored.Filled.HelpOutline,
+                contentDescription = "3D-Tipps",
+                tint = WiggleColors.TextPrimary
+            )
+        }
         IconButton(
             onClick = onOpenSettings,
             modifier = Modifier
@@ -195,6 +211,7 @@ private fun HeaderBar(onOpenSettings: () -> Unit) {
                 contentDescription = "Einstellungen",
                 tint = WiggleColors.TextPrimary
             )
+        }
         }
     }
 }

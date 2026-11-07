@@ -29,6 +29,13 @@ import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.NightsStay
+import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
+import android.os.SystemClock
+import kotlinx.coroutines.delay
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -158,9 +165,15 @@ fun CameraScreen(
 
         val progress = burstProgress
         if (progress != null) {
-            NightHoldOverlay(progress.done, progress.total)
+            NightHoldOverlay(progress)
         } else {
             countdown?.let { CountdownOverlay(it) }
+            if (uiState.nightMode) {
+                NightBadge(
+                    holdMs = controller.estimatedBurstMs(viewModel.nightFrames),
+                    modifier = Modifier.align(Alignment.TopCenter).padding(top = 60.dp)
+                )
+            }
         }
         ShutterFlash(flashCount)
 
@@ -201,6 +214,8 @@ fun CameraScreen(
 
         ShutterBar(
             busy = status.busy,
+            night = uiState.nightMode,
+            burst = burstProgress,
             pending = uiState.pendingJobs,
             onCapture = ::startCapture,
             modifier = Modifier.align(Alignment.BottomCenter)
@@ -304,51 +319,132 @@ private fun NightToggle(enabled: Boolean, onToggle: () -> Unit, modifier: Modifi
     Box(
         modifier = modifier
             .clip(RoundedCornerShape(12.dp))
-            .background(if (enabled) WiggleColors.Accent else WiggleColors.OverlayStrong)
-            .border(1.dp, if (enabled) WiggleColors.Accent else WiggleColors.Outline, RoundedCornerShape(12.dp))
+            .background(if (enabled) NIGHT_BLUE else WiggleColors.OverlayStrong)
+            .border(1.dp, if (enabled) NIGHT_BLUE else WiggleColors.Outline, RoundedCornerShape(12.dp))
             .clickable(onClick = onToggle)
             .padding(horizontal = 12.dp, vertical = 8.dp)
     ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                imageVector = Icons.Default.NightsStay,
+                contentDescription = null,
+                tint = if (enabled) Color.Black else NIGHT_BLUE,
+                modifier = Modifier.size(16.dp)
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(
+                text = if (enabled) "NACHT AN" else "NACHT",
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Black,
+                color = if (enabled) Color.Black else WiggleColors.TextPrimary,
+                letterSpacing = 0.5.sp
+            )
+        }
+    }
+}
+
+/** Moon badge on the live preview while night mode is armed. */
+@Composable
+internal fun NightBadge(holdMs: Long, modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier
+            .background(WiggleColors.OverlayStrong, RoundedCornerShape(20.dp))
+            .border(1.dp, NIGHT_BLUE, RoundedCornerShape(20.dp))
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            imageVector = Icons.Default.NightsStay,
+            contentDescription = "Nachtmodus",
+            tint = NIGHT_BLUE,
+            modifier = Modifier.size(20.dp)
+        )
+        Spacer(modifier = Modifier.width(8.dp))
         Text(
-            text = if (enabled) "☾ NACHT AN" else "☾ NACHT",
+            text = "NACHTMODUS · beim Auslösen ca. ${formatSeconds(holdMs)} ruhig halten",
             fontSize = 11.sp,
-            fontWeight = FontWeight.Black,
-            color = if (enabled) Color.Black else WiggleColors.TextPrimary,
-            letterSpacing = 0.5.sp
+            fontWeight = FontWeight.Bold,
+            color = WiggleColors.TextPrimary
         )
     }
 }
 
-/** Shown while a night burst is being taken. */
+/**
+ * Animated hold-still progress of a running burst: elapsed time against the measured
+ * duration, but never ahead of the frames that actually arrived and never behind them.
+ */
 @Composable
-private fun NightHoldOverlay(done: Int, total: Int) {
+private fun rememberBurstFraction(progress: CameraController.BurstProgress): Pair<Float, Long> {
+    var now by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
+    LaunchedEffect(progress.startedAt) {
+        while (true) {
+            now = SystemClock.elapsedRealtime()
+            delay(16)
+        }
+    }
+    val elapsed = now - progress.startedAt
+    val byTime = elapsed.toFloat() / progress.estimatedMs.coerceAtLeast(1)
+    val lower = progress.done.toFloat() / progress.total
+    val upper = (progress.done + 0.95f) / progress.total
+    val fraction = byTime.coerceIn(lower, upper.coerceAtMost(1f))
+    val remaining = (progress.estimatedMs - elapsed).coerceAtLeast(0)
+    return fraction to remaining
+}
+
+/** Shown while a night burst is being taken; the preview stays visible underneath. */
+@Composable
+internal fun NightHoldOverlay(progress: CameraController.BurstProgress) {
+    val (fraction, _) = rememberBurstFraction(progress)
     Box(
-        modifier = Modifier.fillMaxSize().background(WiggleColors.Scrim),
+        modifier = Modifier.fillMaxSize().background(Color(0x55000000)),
         contentAlignment = Alignment.Center
     ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier
+                .background(WiggleColors.OverlayStrong, RoundedCornerShape(20.dp))
+                .padding(horizontal = 24.dp, vertical = 18.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Default.NightsStay,
+                contentDescription = null,
+                tint = NIGHT_BLUE,
+                modifier = Modifier.size(40.dp)
+            )
+            Spacer(modifier = Modifier.height(8.dp))
             Text(
                 text = "RUHIG HALTEN",
-                fontSize = 30.sp,
+                fontSize = 26.sp,
                 fontWeight = FontWeight.Black,
                 color = WiggleColors.TextPrimary
             )
-            Spacer(modifier = Modifier.height(10.dp))
-            Text(
-                text = "Nachtaufnahme · Bild ${(done + 1).coerceAtMost(total)} von $total",
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Bold,
-                color = WiggleColors.Accent
-            )
             Spacer(modifier = Modifier.height(6.dp))
             Text(
+                text = "Bild ${(progress.done + 1).coerceAtMost(progress.total)} von ${progress.total}",
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+                color = NIGHT_BLUE
+            )
+            Spacer(modifier = Modifier.height(10.dp))
+            LinearProgressIndicator(
+                progress = { fraction },
+                color = NIGHT_BLUE,
+                trackColor = WiggleColors.SurfaceMuted,
+                modifier = Modifier.width(180.dp).height(6.dp).clip(RoundedCornerShape(3.dp))
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
                 text = "Kleine Bewegungen gleicht die App aus",
-                fontSize = 12.sp,
+                fontSize = 11.sp,
                 color = WiggleColors.TextTertiary
             )
         }
     }
 }
+
+private val NIGHT_BLUE = Color(0xFF8AB4FF)
+
+private fun formatSeconds(ms: Long): String = String.format(Locale.GERMANY, "%.1f s", ms / 1000.0)
 
 @Composable
 private fun ZoomPanel(
@@ -500,7 +596,14 @@ private fun CalibrationButton(isCalibrating: Boolean, isApplied: Boolean, onClic
 }
 
 @Composable
-private fun ShutterBar(busy: Boolean, pending: Int, onCapture: () -> Unit, modifier: Modifier = Modifier) {
+internal fun ShutterBar(
+    busy: Boolean,
+    night: Boolean,
+    burst: CameraController.BurstProgress?,
+    pending: Int,
+    onCapture: () -> Unit,
+    modifier: Modifier = Modifier
+) {
     Box(
         modifier = modifier
             .fillMaxWidth()
@@ -512,18 +615,68 @@ private fun ShutterBar(busy: Boolean, pending: Int, onCapture: () -> Unit, modif
             modifier = Modifier
                 .size(72.dp)
                 .padding(6.dp)
-                .border(3.dp, WiggleColors.TextPrimary, CircleShape)
+                .border(
+                    3.dp,
+                    when {
+                        burst != null -> WiggleColors.SurfaceMuted // the progress ring is the border now
+                        night -> NIGHT_BLUE
+                        else -> WiggleColors.TextPrimary
+                    },
+                    CircleShape
+                )
                 .clickable(enabled = !busy, onClick = onCapture),
             contentAlignment = Alignment.Center
         ) {
-            Box(
-                modifier = Modifier
-                    .size(56.dp)
-                    .background(if (busy) WiggleColors.SurfaceMuted else WiggleColors.Accent, CircleShape)
-            )
-            if (busy) {
-                CircularProgressIndicator(color = WiggleColors.Accent, modifier = Modifier.size(56.dp), strokeWidth = 3.dp)
+            when {
+                burst != null -> {
+                    // Night burst running: shutter blocked, ring fills while holding still.
+                    val (fraction, remaining) = rememberBurstFraction(burst)
+                    Box(modifier = Modifier.size(56.dp).background(WiggleColors.SurfaceMuted, CircleShape))
+                    CircularProgressIndicator(
+                        progress = { fraction },
+                        color = NIGHT_BLUE,
+                        trackColor = Color.Transparent,
+                        strokeWidth = 4.dp,
+                        modifier = Modifier.size(60.dp)
+                    )
+                    Text(
+                        text = formatSeconds(remaining),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Black,
+                        color = WiggleColors.TextPrimary
+                    )
+                }
+
+                busy -> {
+                    Box(modifier = Modifier.size(56.dp).background(WiggleColors.SurfaceMuted, CircleShape))
+                    CircularProgressIndicator(color = WiggleColors.Accent, modifier = Modifier.size(56.dp), strokeWidth = 3.dp)
+                }
+
+                night -> {
+                    Box(
+                        modifier = Modifier.size(56.dp).background(NIGHT_BLUE, CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.NightsStay,
+                            contentDescription = "Nachtaufnahme",
+                            tint = Color(0xFF0F1A33),
+                            modifier = Modifier.size(28.dp)
+                        )
+                    }
+                }
+
+                else -> Box(modifier = Modifier.size(56.dp).background(WiggleColors.Accent, CircleShape))
             }
+        }
+        if (burst != null) {
+            Text(
+                text = "Nicht bewegen",
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                color = NIGHT_BLUE,
+                modifier = Modifier.align(Alignment.CenterStart).padding(start = 24.dp)
+            )
         }
         if (pending > 0) {
             Row(

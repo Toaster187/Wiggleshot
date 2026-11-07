@@ -52,6 +52,27 @@ class WiggleAligner(context: Context) {
         STRONG("Stark", 1.8)
     }
 
+    /**
+     * How strong the depth effect of a capture is. With the Pixel 9's 16 mm baseline the
+     * spread is about 1.5 % x (1/near - 1/far) with distances in metres.
+     */
+    enum class DepthRating(val label: String, val tip: String?) {
+        WEAK("schwach", "3D-Effekt schwach – Motiv näher ran (0,5–1 m) und Abstand zum Hintergrund vergrößern"),
+        MEDIUM("mittel", null),
+        STRONG("stark", null);
+
+        companion object {
+            fun of(percent: Double) = when {
+                percent < WEAK_BELOW -> WEAK
+                percent < STRONG_FROM -> MEDIUM
+                else -> STRONG
+            }
+
+            const val WEAK_BELOW = 0.6
+            const val STRONG_FROM = 1.6
+        }
+    }
+
     /** Which depth stays still in the wiggle. */
     enum class Pivot(val label: String) {
         /** The subject in the image centre stays still; front and back move (classic wiggle). */
@@ -103,14 +124,19 @@ class WiggleAligner(context: Context) {
         /** Noise reduction applied to this frame (null = none). */
         val noiseSigma: Double? = null,
         val speckPixels: Int = 0,
-        val denoiseMs: Long = 0
+        val denoiseMs: Long = 0,
+        /** Strength of the 3D effect: depth parallax spread in % of the frame width. */
+        val depthPercent: Double? = null
     ) {
         fun mapX(x: Double, y: Double): Double = field?.mapX(x, y) ?: transform.mapX(x, y)
         fun mapY(x: Double, y: Double): Double = field?.mapY(x, y) ?: transform.mapY(x, y)
 
+        val depthRating: DepthRating? get() = depthPercent?.let { DepthRating.of(it) }
+
         fun summary(): String = String.format(
             Locale.GERMANY,
-            "Zoom %.3f× · Rot %.2f° · Q %s · %s%s",
+            "%sZoom %.3f× · Rot %.2f° · Q %s · %s%s",
+            depthPercent?.let { String.format(Locale.GERMANY, "3D %s (%.1f %%) · ", DepthRating.of(it).label, it) } ?: "",
             equivalentZoom,
             transform.rotationDegrees,
             confidence?.let { String.format(Locale.GERMANY, "%.0f%%", it * 100) } ?: "–",
@@ -409,7 +435,9 @@ class WiggleAligner(context: Context) {
             field = field,
             rectifiedPatches = result?.rectification?.patches ?: 0,
             rectifyRmsBefore = result?.rectification?.rmsBefore?.let { it * secondaryFactor },
-            rectifyRmsAfter = result?.rectification?.rmsAfter?.let { it * secondaryFactor }
+            rectifyRmsAfter = result?.rectification?.rmsAfter?.let { it * secondaryFactor },
+            // working secondary px -> full secondary px -> primary px -> % of the width
+            depthPercent = if (accepted) result.depthSpread?.let { it * secondaryFactor / transform.scale / pw * 100 } else null
         )
     }
 
