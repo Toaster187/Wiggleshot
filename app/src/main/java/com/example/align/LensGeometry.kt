@@ -25,9 +25,19 @@ data class LensGeometry(
     /** Quaternion `(x, y, z, w)`. */
     val poseRotation: FloatArray? = null,
     val poseTranslation: FloatArray? = null,
-    val poseReference: Int? = null
+    val poseReference: Int? = null,
+    /** f-number of the (fixed) aperture. */
+    val apertureF: Float? = null
 ) {
     data class IntRect(val left: Int, val top: Int, val width: Int, val height: Int)
+
+    /** Entrance pupil diameter in mm (focal length / f-number), null if unknown. */
+    val apertureDiameterMm: Double?
+        get() {
+            val f = focalLengthMm ?: return null
+            val n = apertureF ?: return null
+            return if (n > 0f) f / n.toDouble() else null
+        }
 
     /** Pinhole projection of an output frame: focal length and principal point in output px. */
     data class Projection(val focal: Double, val cx: Double, val cy: Double, val width: Int, val height: Int) {

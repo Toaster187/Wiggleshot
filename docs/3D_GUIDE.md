@@ -84,9 +84,11 @@ Ränder, die in nur einem Bild existieren. Die klassische Stereo-Faustregel (nä
 
 - Motiv **0,4–1 m** vor der Kamera.
 - Hintergrund **mindestens 3× so weit** – offener Raum, Fenster, Straße, Landschaft.
-- Motiv **in die Bildmitte**: Mit dem Drehpunkt „Bildmitte“ (Einstellungen) steht es still,
-  Vorder- und Hintergrund bewegen sich gegenläufig. Mit „Hintergrund“ steht der Hintergrund
-  still und das Motiv springt – so wie beim Linsenwechsel der Pixel-Kamera.
+- Motiv **in die Bildmitte**: Dort stellt die Kamera scharf. Mit dem Drehpunkt „Motiv“
+  (Standard) bleibt das Scharfgestellte stehen und die Szene dreht sich darum: der
+  Hintergrund wandert in die eine, Näheres in die andere Richtung. Mit „Hintergrund“ steht der
+  Hintergrund still und das Motiv springt – so wie beim Linsenwechsel der Pixel-Kamera; das
+  wirkt eher wie ein Hin und Her als wie Tiefe.
 - **Schichten**: etwas vorne, das Motiv, dahinter Tiefe. Linien, die in die Tiefe laufen
   (Tisch, Weg, Zaun, Geländer), wirken besonders plastisch.
 - **Hochformat**: Dann liegen die Linsen nebeneinander und der Wiggle geht seitlich, wie
@@ -110,4 +112,23 @@ Ränder, die in nur einem Bild existieren. Die klassische Stereo-Faustregel (nä
   5/5 Bilder genutzt). Bewegte Teile werden aus der Mittelung genommen.
 - Bewegte Motive (Menschen, Tiere): **normaler Modus** – beide Linsen lösen im selben
   Moment aus, Bewegung wird eingefroren.
-- Abspielen: **120–200 ms pro Bild** im Ping-Pong wirkt am natürlichsten.
+- Abspielen: mit Zwischenbildern (Standard: 2) **ca. 90 ms pro Bild**, nur mit den zwei
+  Fotos **120–200 ms** im Ping-Pong.
+
+## Warum zwei Linsen allein wie „zwei Kameras“ wirken – und was die App dagegen tut
+
+1. **Drehpunkt:** Die Ausrichtung allein legt den Ruhepunkt auf die Tiefe, die im Bild
+   dominiert – meist den Hintergrund. Dann springt nur das Motiv hin und her. Die App misst
+   deshalb eine Tiefenkarte und legt den Ruhepunkt auf die scharfgestellte Ebene
+   (Testaufnahme Hand: Hand vorher 3,3 % Sprung, jetzt < 0,1 %; der Hintergrund schwenkt).
+2. **Tiefenschärfe:** Die 1×-Linse (f/1,68, 4,1 mm Öffnung) lässt bei naher Fokussierung den
+   Hintergrund verschwimmen, die 0,5×-Linse (1,2 mm Öffnung) zeigt alles scharf. Der
+   Unschärfedurchmesser ist proportional zur Parallaxe zur Fokusebene:
+   `Unschärfe = Öffnung / Basis × Parallaxe` (4,1 / 16 ≈ 0,26). Die App gibt dem 0,5×-Bild
+   genau diese Unschärfe.
+3. **Sprung statt Bewegung:** Zwei Bilder springen. Aus Tiefenkarte und beiden Fotos
+   berechnet die App Zwischenansichten (je eine aus jeder Kamera), sodass sich die Szene
+   fließend um das Motiv dreht.
+4. **Auflösung:** Über das Bildfeld der 1×-Linse hat die 0,5×-Linse nur ~1300 Pixel. Die
+   Wiggle-Bilder werden deshalb mit höchstens 2048 px Kantenlänge ausgegeben, damit beide
+   Bilder gleich scharf wirken.

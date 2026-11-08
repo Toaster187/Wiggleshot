@@ -88,7 +88,8 @@ fun PlayerScreen(
     }
 
     var isPingPong by remember { mutableStateOf(true) }
-    var frameDelayMs by remember { mutableFloatStateOf(250f) }
+    // Many frames (in-between views) want a quick, smooth sweep; a plain pair a slower wiggle.
+    var frameDelayMs by remember(imagePaths.size) { mutableFloatStateOf(if (imagePaths.size > 2) 90f else 250f) }
     var currentFrame by remember { mutableIntStateOf(0) }
     var isExporting by remember { mutableStateOf(false) }
 

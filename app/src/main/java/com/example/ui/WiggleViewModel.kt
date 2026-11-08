@@ -69,8 +69,10 @@ data class WiggleUiState(
     val pendingJobs: Int = 0,
     /** Night mode: several frames per lens, aligned and averaged (hold still ~1 s). */
     val nightMode: Boolean = false,
-    val pivot: WiggleAligner.Pivot = WiggleAligner.Pivot.CENTER,
+    val pivot: WiggleAligner.Pivot = WiggleAligner.Pivot.SUBJECT,
     val denoise: WiggleAligner.Denoise = WiggleAligner.Denoise.AUTO,
+    val depthOfField: Boolean = true,
+    val inBetweenFrames: Int = 2,
     /** True once a capture has been taken that "export last capture" can write out. */
     val hasLastCapture: Boolean = false
 ) {
@@ -143,7 +145,7 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
                 val savedColorMatch = SettingsManager.getColorMatch(context)
                 val savedDiagnostics = SettingsManager.getDiagnosticsMode(context)
                 val savedPivot = runCatching { WiggleAligner.Pivot.valueOf(SettingsManager.getPivot(context)) }
-                    .getOrDefault(WiggleAligner.Pivot.CENTER)
+                    .getOrDefault(WiggleAligner.Pivot.SUBJECT)
                 val savedDenoise = runCatching { WiggleAligner.Denoise.valueOf(SettingsManager.getDenoise(context)) }
                     .getOrDefault(WiggleAligner.Denoise.AUTO)
                 val savedNight = SettingsManager.getNightMode(context)
@@ -178,6 +180,8 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
                         diagnosticsMode = savedDiagnostics,
                         pivot = savedPivot,
                         denoise = savedDenoise,
+                        depthOfField = SettingsManager.getDepthOfField(context),
+                        inBetweenFrames = SettingsManager.getInBetweenFrames(context),
                         nightMode = savedNight,
                         concurrentPreviewSupported = discovery.concurrentPreviewSupported,
                         previewStateMessage = if (discovery.concurrentPreviewSupported) {
@@ -465,7 +469,9 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
                 colorMatch = state.colorMatch,
                 simultaneous = job.capture.simultaneous,
                 pivot = state.pivot,
-                denoise = state.denoise
+                denoise = state.denoise,
+                depthOfField = state.depthOfField,
+                inBetweenFrames = state.inBetweenFrames
             )
         )
         lastCapture = job.capture to output.reports
@@ -521,6 +527,16 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
 
     /** Frames per lens of a night capture. */
     val nightFrames: Int get() = NIGHT_FRAMES
+
+    fun setDepthOfField(context: Context, enabled: Boolean) {
+        SettingsManager.saveDepthOfField(context, enabled)
+        _uiState.update { it.copy(depthOfField = enabled) }
+    }
+
+    fun setInBetweenFrames(context: Context, count: Int) {
+        SettingsManager.saveInBetweenFrames(context, count)
+        _uiState.update { it.copy(inBetweenFrames = count) }
+    }
 
     fun setDenoise(context: Context, denoise: WiggleAligner.Denoise) {
         SettingsManager.saveDenoise(context, denoise.name)
@@ -682,7 +698,10 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
     private suspend fun saveFrames(context: Context, bitmaps: List<Bitmap>, timestamp: Long) {
         val savedPaths = bitmaps.mapIndexedNotNull { index, bitmap ->
             val path = WiggleProcessor.saveToInternalFiles(context, bitmap, "cam_${index}_$timestamp.jpg")
-            WiggleProcessor.saveToGallery(context, bitmap, "Wiggle_${timestamp}_Frame_$index")
+            // Only the two real photos go to the gallery; in-between views stay in the app.
+            if (index == 0 || index == bitmaps.lastIndex) {
+                WiggleProcessor.saveToGallery(context, bitmap, "Wiggle_${timestamp}_Frame_$index")
+            }
             path?.takeIf { it.isNotEmpty() }
         }
         bitmaps.forEach { it.recycle() }

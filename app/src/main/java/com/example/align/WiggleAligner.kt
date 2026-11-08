@@ -13,6 +13,7 @@ import com.example.camera.CapturedFrame
 import com.example.camera.LensMetadata
 import java.util.Locale
 import kotlin.math.abs
+import kotlin.math.ceil
 import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
@@ -39,8 +40,12 @@ class WiggleAligner(context: Context) {
         val learnCalibration: Boolean = true,
         /** True if all frames were taken at the same instant (dual physical / CameraX pair). */
         val simultaneous: Boolean = true,
-        val pivot: Pivot = Pivot.CENTER,
-        val denoise: Denoise = Denoise.AUTO
+        val pivot: Pivot = Pivot.SUBJECT,
+        val denoise: Denoise = Denoise.AUTO,
+        /** Give the ultra wide the main lens' depth of field ([LensBlur]). */
+        val depthOfField: Boolean = true,
+        /** In-between views between the two lenses ([ViewSynthesis]), 0 = off. */
+        val inBetweenFrames: Int = 2
     )
 
     /** Noise reduction of magnified secondary frames ([NoiseReducer]). */
@@ -75,7 +80,13 @@ class WiggleAligner(context: Context) {
 
     /** Which depth stays still in the wiggle. */
     enum class Pivot(val label: String) {
-        /** The subject in the image centre stays still; front and back move (classic wiggle). */
+        /**
+         * The subject the main lens focused on stays still and the scene turns around it:
+         * the background moves one way, anything nearer the other (classic wiggle).
+         */
+        SUBJECT("Motiv"),
+
+        /** The depth in the image centre stays still. */
         CENTER("Bildmitte"),
 
         /** The dominant (usually far) background stays still, like the Pixel camera's lens switch. */
@@ -126,7 +137,16 @@ class WiggleAligner(context: Context) {
         val speckPixels: Int = 0,
         val denoiseMs: Long = 0,
         /** Strength of the 3D effect: depth parallax spread in % of the frame width. */
-        val depthPercent: Double? = null
+        val depthPercent: Double? = null,
+        /** Shift that put the pivot depth at rest (primary px along the baseline). */
+        val depthPivotShiftPx: Double = 0.0,
+        /** True if the depth the main lens focused on was found. */
+        val focusFound: Boolean? = null,
+        /** Largest blur added to match the main lens' depth of field (output px). */
+        val dofMaxBlurPx: Double? = null,
+        val inBetweenFrames: Int = 0,
+        /** Time of the depth map, blur and in-between views. */
+        val depthMs: Long = 0
     ) {
         fun mapX(x: Double, y: Double): Double = field?.mapX(x, y) ?: transform.mapX(x, y)
         fun mapY(x: Double, y: Double): Double = field?.mapY(x, y) ?: transform.mapY(x, y)
@@ -141,6 +161,8 @@ class WiggleAligner(context: Context) {
             transform.rotationDegrees,
             confidence?.let { String.format(Locale.GERMANY, "%.0f%%", it * 100) } ?: "–",
             if (uncertain) "unsicher (${source.label})" else source.label,
+            (if (inBetweenFrames > 0) " · $inBetweenFrames Zwischenbilder" else "") +
+                (dofMaxBlurPx?.let { String.format(Locale.GERMANY, " · Tiefenschärfe ≤%.0f px", it) } ?: "") +
             if (rectifyRmsBefore != null && rectifyRmsAfter != null) {
                 String.format(Locale.GERMANY, " · vertikal %.1f→%.1f px", rectifyRmsBefore, rectifyRmsAfter)
             } else if (field != null) {
@@ -184,7 +206,6 @@ class WiggleAligner(context: Context) {
         }
 
         val crop = commonCrop(pw, ph, reports, remainingPrimaryZoom)
-        val outFrames = mutableListOf<Bitmap>()
         val primaryOut = if (crop.left == 0 && crop.top == 0 && crop.width() == pw && crop.height() == ph) {
             primary.bitmap
         } else {
@@ -192,10 +213,28 @@ class WiggleAligner(context: Context) {
                 if (it !== primary.bitmap) primary.bitmap.recycle()
             }
         }
-        outFrames += primaryOut
+        // Output at most MAX_OUTPUT_DIMENSION: the ultra wide only has ~1300 px across the
+        // main frame's field of view, so larger frames only make the two lenses look more
+        // different (one sharp, one soft).
+        val outFactor = max(1, ceil(max(crop.width(), crop.height()) / MAX_OUTPUT_DIMENSION.toDouble()).toInt())
 
+        // Depth map before the final warp: it decides which depth stays still (pivot).
+        val depth = if (frames.size == 2 && settings.autoAlign && settings.simultaneous) {
+            runCatching { depthPrepass(primaryOut, frames[1], reports[0], crop, outFactor, settings) }
+                .onFailure { Log.e(TAG, "Depth analysis failed", it) }
+                .getOrNull()
+        } else {
+            null
+        }
+        val adjustedReports = if (depth != null && depth.pivot != 0.0) {
+            listOf(reports[0].shiftedAlongX(depth.pivot * depth.cropPerMap)) + reports.drop(1)
+        } else {
+            reports
+        }
+
+        val warpedFrames = mutableListOf<Bitmap>()
         val finalReports = frames.drop(1).mapIndexed { index, secondary ->
-            val report = reports[index]
+            val report = adjustedReports[index]
             // Magnified frames (the 0.5x lens) are denoised at their native resolution first,
             // only on the part that ends up in the output.
             val denoise = settings.denoise != Denoise.OFF &&
@@ -216,16 +255,196 @@ class WiggleAligner(context: Context) {
             if (settings.colorMatch) {
                 correction = matchColors(primaryOut, warped)
             }
-            outFrames += warped
+            warpedFrames += warped
             report.copy(
                 colorCorrection = correction,
                 noiseSigma = region?.stats?.mottleSigma,
                 speckPixels = region?.stats?.speckPixels ?: 0,
                 denoiseMs = region?.stats?.elapsedMs ?: 0
             )
+        }.toMutableList()
+
+        val primaryFinal = downscale(primaryOut, outFactor)
+        val secondaryFinal = warpedFrames.map { downscale(it, outFactor) }.toMutableList()
+        val outFrames = mutableListOf(primaryFinal)
+        if (depth != null && secondaryFinal.size == 1) {
+            val finished = runCatching { finishDepth(primaryFinal, secondaryFinal[0], depth, settings) }
+                .onFailure { Log.e(TAG, "Depth effects failed", it) }
+                .getOrNull()
+            if (finished != null) {
+                secondaryFinal[0].recycle()
+                secondaryFinal[0] = finished.secondary
+                outFrames += finished.inBetween
+                finalReports[0] = finalReports[0].copy(
+                    depthPivotShiftPx = depth.pivot * depth.cropPerMap,
+                    focusFound = depth.focus != null,
+                    dofMaxBlurPx = finished.maxBlur,
+                    inBetweenFrames = finished.inBetween.size,
+                    depthMs = depth.elapsedMs + finished.elapsedMs
+                )
+            } else {
+                finalReports[0] = finalReports[0].copy(
+                    depthPivotShiftPx = depth.pivot * depth.cropPerMap,
+                    focusFound = depth.focus != null,
+                    depthMs = depth.elapsedMs
+                )
+            }
         }
+        outFrames += secondaryFinal
         finalReports.forEach { Log.d(TAG, "Lens ${it.lensId}: ${it.summary()} transform=${it.transform}") }
         return Output(outFrames, finalReports, crop)
+    }
+
+    /** Disparity maps of a pair, measured before the final warp, and the chosen pivot. */
+    private class DepthPrepass(
+        val primary: DisparityMap,
+        val secondary: DisparityMap,
+        /** Disparity (map px) that stays still in the wiggle, relative to the warp used. */
+        val pivot: Double,
+        /** Disparity of the focus plane (map px), null if not found. */
+        val focus: Double?,
+        /** Crop (input) px per map px, and output px per map px. */
+        val cropPerMap: Double,
+        val outPerMap: Double,
+        val blurRatio: Double,
+        val ownBlurRatio: Double,
+        val elapsedMs: Long
+    )
+
+    private class DepthFinish(val secondary: Bitmap, val inBetween: List<Bitmap>, val maxBlur: Double?, val elapsedMs: Long)
+
+    private fun depthPrepass(
+        primaryOut: Bitmap,
+        secondary: CapturedFrame,
+        report: Report,
+        crop: Rect,
+        outFactor: Int,
+        settings: Settings
+    ): DepthPrepass? {
+        if (report.uncertain || report.source != Source.IMAGE) return null
+        val needed = settings.pivot != Pivot.BACKGROUND || settings.depthOfField || settings.inBetweenFrames > 0
+        if (!needed) return null
+        val start = System.nanoTime()
+        val geometryP = LensMetadata.geometry(cameraManager, report.primaryId)
+        val geometryS = LensMetadata.geometry(cameraManager, report.lensId)
+        val baseline = if (geometryP != null && geometryS != null) LensGeometry.baselineInImage(geometryP, geometryS) else null
+        // Parallax must run along the image x axis (portrait frames of the Pixel 9).
+        if (baseline != null && abs(baseline.second) > abs(baseline.first)) return null
+
+        val mapFactor = outFactor * MAP_DOWNSCALE
+        val pMap = primaryOut.toGrayImage(mapFactor)
+        val mw = pMap.width
+        val mh = pMap.height
+        // The secondary, resampled into the primary's geometry at map resolution.
+        val sFactor = max(1, (report.transform.scale * mapFactor).roundToInt())
+        val sGray = secondary.bitmap.toGrayImage(sFactor)
+        val sMap = GrayImage(mw, mh)
+        for (my in 0 until mh) for (mx in 0 until mw) {
+            val xp = crop.left + (mx + 0.5) * mapFactor
+            val yp = crop.top + (my + 0.5) * mapFactor
+            sMap.data[my * mw + mx] = sGray.sample(report.mapX(xp, yp) / sFactor, report.mapY(xp, yp) / sFactor)
+        }
+        val maps = StereoMatcher.matchPair(pMap, sMap, max(4, (mw * MAX_DISPARITY_FRACTION).roundToInt()))
+        if (maps.primary.width != mw || maps.primary.reliableFraction() < 0.04) {
+            Log.w(TAG, "Depth map not reliable (${maps.primary.reliableFraction()})")
+            return null
+        }
+        val focus = FocusFinder.focusDisparity(pMap, sMap, maps.primary)
+        val center = maps.primary.median(0.33, 0.67, 0.33, 0.67) ?: 0.0
+        val pivot = when (settings.pivot) {
+            Pivot.SUBJECT -> focus ?: center
+            Pivot.CENTER -> center
+            Pivot.BACKGROUND -> 0.0
+        }
+        val baselineMm = if (geometryP != null && geometryS != null) LensGeometry.baselineMm(geometryP, geometryS) else null
+        val b = baselineMm?.takeIf { it > 1.0 } ?: DEFAULT_BASELINE_MM
+        val ratio = (geometryP?.apertureDiameterMm ?: DEFAULT_MAIN_APERTURE_MM) / b
+        val own = (geometryS?.apertureDiameterMm ?: DEFAULT_UW_APERTURE_MM) / b
+        Log.d(TAG, "Depth: focus=$focus center=$center pivot=$pivot map ${mw}x$mh reliable=${"%.2f".format(maps.primary.reliableFraction())}")
+        return DepthPrepass(
+            primary = maps.primary,
+            secondary = maps.secondary,
+            pivot = pivot,
+            focus = focus,
+            cropPerMap = mapFactor.toDouble(),
+            outPerMap = MAP_DOWNSCALE.toDouble(),
+            blurRatio = ratio,
+            ownBlurRatio = own,
+            elapsedMs = (System.nanoTime() - start) / 1_000_000
+        )
+    }
+
+    private fun finishDepth(primary: Bitmap, secondary: Bitmap, depth: DepthPrepass, settings: Settings): DepthFinish? {
+        val start = System.nanoTime()
+        val w = secondary.width
+        val h = secondary.height
+        if (primary.width != w || primary.height != h) return null
+        // Maps relative to the pivot, in the frames as they are now (ultra wide shifted).
+        val dP = depth.primary.minus(depth.pivot)
+        val dS = depth.secondary.reReferenced(depth.pivot, depth.pivot)
+        val scale = w.toDouble() / dP.width
+        var sPixels = IntArray(w * h).also { secondary.getPixels(it, 0, w, 0, 0, w, h) }
+        var maxBlur: Double? = null
+        var blurredBitmap: Bitmap? = null
+        if (settings.depthOfField && depth.focus != null) {
+            LensBlur.apply(sPixels, w, h, dS, scale, depth.focus - depth.pivot, depth.blurRatio, depth.ownBlurRatio)?.let { (pixels, stats) ->
+                sPixels = pixels
+                maxBlur = stats.maxDiameter
+                blurredBitmap = Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)
+            }
+        }
+        val views = mutableListOf<Bitmap>()
+        val count = settings.inBetweenFrames.coerceIn(0, 4)
+        if (count > 0) {
+            val pPixels = IntArray(w * h).also { primary.getPixels(it, 0, w, 0, 0, w, h) }
+            val occP = ViewSynthesis.occlusion(dP, dS, 1.0)
+            val occS = ViewSynthesis.occlusion(dS, dP, -1.0)
+            for (i in 1..count) {
+                val t = i / (count + 1.0)
+                val view = ViewSynthesis.render(t, pPixels, sPixels, w, h, dP, dS, occP, occS, scale)
+                views += Bitmap.createBitmap(view, w, h, Bitmap.Config.ARGB_8888)
+            }
+        }
+        if (blurredBitmap == null && views.isEmpty()) return null
+        val finalSecondary = blurredBitmap ?: secondary.copy(Bitmap.Config.ARGB_8888, false)
+        return DepthFinish(finalSecondary, views, maxBlur, (System.nanoTime() - start) / 1_000_000)
+    }
+
+    /** Integer factor area downscale (keeps the two frames equally sharp, no aliasing). */
+    private fun downscale(source: Bitmap, factor: Int): Bitmap {
+        if (factor <= 1) return source
+        val w = source.width / factor
+        val h = source.height / factor
+        val row = IntArray(source.width * factor)
+        val out = IntArray(w * h)
+        val n = factor * factor
+        for (y in 0 until h) {
+            source.getPixels(row, 0, source.width, 0, y * factor, source.width, factor)
+            for (x in 0 until w) {
+                var r = 0
+                var g = 0
+                var b = 0
+                for (dy in 0 until factor) {
+                    val base = dy * source.width + x * factor
+                    for (dx in 0 until factor) {
+                        val p = row[base + dx]
+                        r += (p shr 16) and 0xFF
+                        g += (p shr 8) and 0xFF
+                        b += p and 0xFF
+                    }
+                }
+                out[y * w + x] = (0xFF shl 24) or ((r / n) shl 16) or ((g / n) shl 8) or (b / n)
+            }
+        }
+        source.recycle()
+        return Bitmap.createBitmap(out, w, h, Bitmap.Config.ARGB_8888)
+    }
+
+    /** The report with its transform moved by [shift] primary px along +x (pivot change). */
+    private fun Report.shiftedAlongX(shift: Double): Report {
+        val t = transform
+        val moved = t.copy(tx = t.tx + t.a * shift, ty = t.ty + t.b * shift)
+        return copy(transform = moved, field = field?.withBase(moved))
     }
 
     /**
@@ -682,5 +901,17 @@ class WiggleAligner(context: Context) {
 
         /** Factor around the expected scale covered by the last-resort free search. */
         const val FREE_RANGE = 4.0
+
+        /** Longest edge of the output frames. */
+        const val MAX_OUTPUT_DIMENSION = 2048
+
+        /** Depth maps have a quarter of the output resolution. */
+        const val MAP_DOWNSCALE = 4
+        const val MAX_DISPARITY_FRACTION = 0.07
+
+        /** Pixel 9 values if the metadata lacks them. */
+        const val DEFAULT_BASELINE_MM = 16.0
+        const val DEFAULT_MAIN_APERTURE_MM = 6.9 / 1.68
+        const val DEFAULT_UW_APERTURE_MM = 2.02 / 1.7
     }
 }

@@ -16,6 +16,8 @@ object SettingsManager {
     private const val KEY_PIVOT = "pivot"
     private const val KEY_DENOISE = "denoise_secondary"
     private const val KEY_NIGHT = "night_mode"
+    private const val KEY_DOF = "match_depth_of_field"
+    private const val KEY_IN_BETWEEN = "in_between_frames"
 
     private const val TAG = "SettingsManager"
 
@@ -44,7 +46,7 @@ object SettingsManager {
     fun saveDiagnosticsMode(context: Context, value: Boolean) =
         prefs(context).edit().putBoolean(KEY_DIAGNOSTICS, value).apply()
 
-    fun getPivot(context: Context): String = prefs(context).getString(KEY_PIVOT, "CENTER") ?: "CENTER"
+    fun getPivot(context: Context): String = prefs(context).getString(KEY_PIVOT, "SUBJECT") ?: "SUBJECT"
 
     fun savePivot(context: Context, value: String) = prefs(context).edit().putString(KEY_PIVOT, value).apply()
 
@@ -55,6 +57,14 @@ object SettingsManager {
     fun getNightMode(context: Context): Boolean = prefs(context).getBoolean(KEY_NIGHT, false)
 
     fun saveNightMode(context: Context, value: Boolean) = prefs(context).edit().putBoolean(KEY_NIGHT, value).apply()
+
+    fun getDepthOfField(context: Context): Boolean = prefs(context).getBoolean(KEY_DOF, true)
+
+    fun saveDepthOfField(context: Context, value: Boolean) = prefs(context).edit().putBoolean(KEY_DOF, value).apply()
+
+    fun getInBetweenFrames(context: Context): Int = prefs(context).getInt(KEY_IN_BETWEEN, 2)
+
+    fun saveInBetweenFrames(context: Context, value: Int) = prefs(context).edit().putInt(KEY_IN_BETWEEN, value).apply()
 
     private fun prefs(context: Context) = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 

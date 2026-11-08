@@ -45,7 +45,8 @@ object LensMetadata {
             distortion = distortion,
             poseRotation = chars.get(CameraCharacteristics.LENS_POSE_ROTATION),
             poseTranslation = chars.get(CameraCharacteristics.LENS_POSE_TRANSLATION),
-            poseReference = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) chars.get(CameraCharacteristics.LENS_POSE_REFERENCE) else null
+            poseReference = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) chars.get(CameraCharacteristics.LENS_POSE_REFERENCE) else null,
+            apertureF = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES)?.firstOrNull()
         )
     }
 

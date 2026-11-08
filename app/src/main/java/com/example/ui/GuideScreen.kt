@@ -96,7 +96,7 @@ fun GuideScreen(onBack: () -> Unit) {
         Card("So wird es stark") {
             Tip("1", "Motiv nah: 0,4–1 m vor der Kamera. Unter 0,3 m wird es zu viel (Kanten reißen auf).")
             Tip("2", "Hintergrund weit weg: mindestens 3× so weit wie das Motiv, am besten offener Raum, Fenster, Straße.")
-            Tip("3", "Motiv in die Bildmitte: dort liegt der Drehpunkt, das Motiv steht still und alles andere wiggelt drumherum.")
+            Tip("3", "Motiv in die Bildmitte: dort stellt die Kamera scharf, und was scharf ist, bleibt im Wiggle stehen – die Szene dreht sich darum.")
             Tip("4", "Schichten: ein Gegenstand vorne, das Motiv, dahinter Raum – Diagonalen (Tisch, Weg, Zaun) wirken besonders.")
             Tip("5", "Hochformat halten: Die Linsen liegen dann nebeneinander und der Wiggle geht seitlich.")
         }

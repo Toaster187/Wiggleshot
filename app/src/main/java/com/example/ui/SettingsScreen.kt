@@ -581,6 +581,23 @@ private fun AlignmentSection(viewModel: WiggleViewModel, uiState: WiggleUiState)
             onChange = { viewModel.setColorMatch(context, it) }
         )
         PivotSelector(selected = uiState.pivot, onSelect = { viewModel.setPivot(context, it) })
+        SettingSwitch(
+            title = "Tiefenschärfe angleichen",
+            subtitle = "Die 1×-Linse stellt nahe Motive scharf und lässt den Hintergrund verschwimmen, " +
+                "die 0,5×-Linse zeigt alles scharf. Die App misst die Tiefe und gibt dem 0,5×-Bild " +
+                "dieselbe Unschärfe – sonst wirken die beiden Bilder wie von zwei Kameras.",
+            checked = uiState.depthOfField,
+            onChange = { viewModel.setDepthOfField(context, it) }
+        )
+        ChipSelector(
+            title = "Zwischenbilder",
+            subtitle = "Berechnet Ansichten zwischen den beiden Linsen, damit sich das Bild fließend um " +
+                "das Motiv dreht statt hin und her zu springen. An Kanten naher Objekte können " +
+                "kleine Fehler entstehen.",
+            options = listOf(0 to "Aus", 2 to "2", 4 to "4"),
+            selected = uiState.inBetweenFrames,
+            onSelect = { viewModel.setInBetweenFrames(context, it) }
+        )
         ChipSelector(
             title = "Rauschfilter 0,5×",
             subtitle = "Die 0,5×-Linse hat einen ~3× kleineren Sensor und wird ~2,3× vergrößert; bei " +
@@ -707,9 +724,10 @@ private fun PivotSelector(selected: WiggleAligner.Pivot, onSelect: (WiggleAligne
     Column {
         Text(text = "Drehpunkt des Wiggles", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.White)
         Text(
-            text = "Bildmitte: das Motiv in der Mitte steht still, Vorder- und Hintergrund bewegen sich " +
-                "(klassischer Wiggle). Hintergrund: der Hintergrund steht still wie beim Linsenwechsel " +
-                "der Pixel-Kamera, nahe Objekte springen stärker.",
+            text = "Motiv: was die 1×-Linse scharfgestellt hat, steht still und die Szene dreht sich " +
+                "darum (klassischer Wiggle). Bildmitte: die Tiefe in der Mitte steht still. " +
+                "Hintergrund: der Hintergrund steht still wie beim Linsenwechsel der Pixel-Kamera, " +
+                "nahe Objekte springen hin und her.",
             fontSize = 12.sp,
             color = Color.Gray,
             lineHeight = 16.sp
