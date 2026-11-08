@@ -301,6 +301,17 @@ class DualPhysicalSession(
 
     private val previewCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+            val ae = result.get(CaptureResult.CONTROL_AE_STATE)
+            val settled = ae == CaptureResult.CONTROL_AE_STATE_CONVERGED ||
+                ae == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED ||
+                ae == CaptureResult.CONTROL_AE_STATE_LOCKED
+            // Only frames taken with the current LED state count.
+            val frameTorch = request.get(CaptureRequest.FLASH_MODE) == CaptureRequest.FLASH_MODE_TORCH
+            if (!settled || frameTorch != torchOn) {
+                aeConvergedSince = 0L
+            } else if (aeConvergedSince == 0L) {
+                aeConvergedSince = android.os.SystemClock.elapsedRealtime()
+            }
             val primary = physicalIdA?.let { id -> physicalResult(result, id) } ?: result
             latestPreview = PreviewStats(
                 exposureNs = primary.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: result.get(CaptureResult.SENSOR_EXPOSURE_TIME),
@@ -327,16 +338,24 @@ class DualPhysicalSession(
             }
         }
 
+    private var previewSurfaces: Pair<Surface, Surface>? = null
+
     private fun startPreview(
         camera: CameraDevice,
         captureSession: CameraCaptureSession,
         surfaceA: Surface,
-        surfaceB: Surface
+        surfaceB: Surface,
+        torch: Boolean = false
     ): Boolean = try {
+        previewSurfaces = surfaceA to surfaceB
         val builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
             addTarget(surfaceA)
             addTarget(surfaceB)
             set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            if (torch) {
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH)
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 set(CaptureRequest.CONTROL_ZOOM_RATIO, minZoomRatio)
             }
@@ -346,6 +365,45 @@ class DualPhysicalSession(
     } catch (e: Exception) {
         Log.e(TAG, "Could not start preview", e)
         false
+    }
+
+    /** True if the camera has a flash unit (the LED next to the lenses). */
+    val hasFlash: Boolean = runCatching {
+        cameraManager.getCameraCharacteristics(logicalCameraId).get(CameraCharacteristics.FLASH_INFO_AVAILABLE)
+    }.getOrNull() == true
+
+    /**
+     * Switches the LED on or off in the live preview. With it on, auto exposure adapts to the
+     * flash-lit scene: the near subject gets bright, the far background stays dark.
+     */
+    fun setTorch(on: Boolean): Boolean {
+        if (closed || !hasFlash) return false
+        val camera = device ?: return false
+        val captureSession = session ?: return false
+        val (a, b) = previewSurfaces ?: return false
+        aeConvergedSince = 0L
+        torchOn = on
+        return startPreview(camera, captureSession, a, b, torch = on)
+    }
+
+    @Volatile
+    private var torchOn = false
+
+    /** Time (elapsedRealtime) since which preview frames report a converged exposure, 0 = not. */
+    @Volatile
+    private var aeConvergedSince = 0L
+
+    /**
+     * Waits until auto exposure has settled with the LED on (at least [minMs], at most
+     * [maxMs]), so the flash capture is exposed for the lit scene.
+     */
+    suspend fun awaitExposure(minMs: Long, maxMs: Long) {
+        val start = android.os.SystemClock.elapsedRealtime()
+        delay(minMs)
+        while (android.os.SystemClock.elapsedRealtime() - start < maxMs) {
+            if (aeConvergedSince != 0L) return
+            delay(30)
+        }
     }
 
     /** One synchronised still capture: both JPEGs plus the capture result of each lens. */
@@ -375,7 +433,7 @@ class DualPhysicalSession(
      * balance are locked for the burst so all frames can be averaged. [onProgress] reports
      * how many complete pairs have arrived. Returns null on failure or timeout.
      */
-    suspend fun captureBurst(count: Int, onProgress: (Int) -> Unit = {}): List<DualCapture>? {
+    suspend fun captureBurst(count: Int, onProgress: (Int) -> Unit = {}, torch: Boolean = false): List<DualCapture>? {
         if (closed || count < 1) return null
         val camera = device ?: return null
         val captureSession = session ?: return null
@@ -393,6 +451,10 @@ class DualPhysicalSession(
                     if (count > 1) {
                         set(CaptureRequest.CONTROL_AE_LOCK, true)
                         set(CaptureRequest.CONTROL_AWB_LOCK, true)
+                    }
+                    if (torch && hasFlash) {
+                        set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                        set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH)
                     }
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                         set(CaptureRequest.CONTROL_ZOOM_RATIO, minZoomRatio)

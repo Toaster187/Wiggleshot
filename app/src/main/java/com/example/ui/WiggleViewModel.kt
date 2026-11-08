@@ -69,6 +69,8 @@ data class WiggleUiState(
     val pendingJobs: Int = 0,
     /** Night mode: several frames per lens, aligned and averaged (hold still ~1 s). */
     val nightMode: Boolean = false,
+    /** Flash with the disposable camera look (never together with [nightMode]). */
+    val flashMode: Boolean = false,
     val pivot: WiggleAligner.Pivot = WiggleAligner.Pivot.SUBJECT,
     val denoise: WiggleAligner.Denoise = WiggleAligner.Denoise.AUTO,
     val depthOfField: Boolean = true,
@@ -183,6 +185,7 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
                         depthOfField = SettingsManager.getDepthOfField(context),
                         inBetweenFrames = SettingsManager.getInBetweenFrames(context),
                         nightMode = savedNight,
+                        flashMode = !savedNight && SettingsManager.getFlashMode(context),
                         concurrentPreviewSupported = discovery.concurrentPreviewSupported,
                         previewStateMessage = if (discovery.concurrentPreviewSupported) {
                             "Dual Cameras Active"
@@ -471,7 +474,9 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
                 pivot = state.pivot,
                 denoise = state.denoise,
                 depthOfField = state.depthOfField,
-                inBetweenFrames = state.inBetweenFrames
+                inBetweenFrames = state.inBetweenFrames,
+                // The capture itself decides: the mode may have changed since the shot.
+                flashLook = job.capture.flash
             )
         )
         lastCapture = job.capture to output.reports
@@ -514,11 +519,35 @@ class WiggleViewModel(private val repository: WiggleRepository) : ViewModel() {
 
     fun setNightMode(context: Context, enabled: Boolean) {
         SettingsManager.saveNightMode(context, enabled)
+        if (enabled) SettingsManager.saveFlashMode(context, false)
         _uiState.update {
             it.copy(
                 nightMode = enabled,
+                flashMode = if (enabled) false else it.flashMode,
                 message = if (enabled) "Nachtmodus: beim Auslösen ~1 s ruhig halten" else null
             )
+        }
+    }
+
+    fun setFlashMode(context: Context, enabled: Boolean) {
+        SettingsManager.saveFlashMode(context, enabled)
+        if (enabled) SettingsManager.saveNightMode(context, false)
+        _uiState.update {
+            it.copy(
+                flashMode = enabled,
+                nightMode = if (enabled) false else it.nightMode,
+                message = if (enabled) "Blitz: Einwegkamera-Look – Motiv nah ran, Hintergrund wird dunkel" else null
+            )
+        }
+    }
+
+    /** Light button next to the shutter: normal → night → flash → normal. */
+    fun cycleLightMode(context: Context) {
+        val state = _uiState.value
+        when {
+            state.nightMode -> setFlashMode(context, true)
+            state.flashMode -> setFlashMode(context, false)
+            else -> setNightMode(context, true)
         }
     }
 

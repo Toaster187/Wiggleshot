@@ -110,6 +110,11 @@ Ränder, die in nur einem Bild existieren. Die klassische Stereo-Faustregel (nä
 - Dunkel: **Nachtmodus** (Mond-Symbol). Etwa 1 s ruhig halten – der Ring um den Auslöser
   zeigt, wie lange noch. Kleine Wackler gleicht die App aus (Testserie: 1,7–7 px Bewegung,
   5/5 Bilder genutzt). Bewegte Teile werden aus der Mittelung genommen.
+- **Blitz** (Licht-Knopf: Normal → Nacht → Blitz): Die LED leuchtet beim Auslösen kurz auf
+  und die App gibt dem Wiggle den Look einer billigen Einwegkamera – überstrahltes Motiv,
+  Hintergrund fast schwarz, warme Farben, harter Kontrast, Vignette und Korn. Den Abfall des
+  Lichts zum Hintergrund verstärkt sie mit der Tiefenkarte (Licht nimmt mit 1/Entfernung² ab).
+  Am besten mit Menschen 0,5–1,5 m vor der Kamera in einem dunklen Raum.
 - Bewegte Motive (Menschen, Tiere): **normaler Modus** – beide Linsen lösen im selben
   Moment aus, Bewegung wird eingefroren.
 - Abspielen: mit Zwischenbildern (Standard: 2) **ca. 90 ms pro Bild**, nur mit den zwei

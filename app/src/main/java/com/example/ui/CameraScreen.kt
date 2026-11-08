@@ -31,6 +31,8 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.NightsStay
+import androidx.compose.material.icons.filled.FlashOn
+import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import android.os.SystemClock
@@ -138,7 +140,8 @@ fun CameraScreen(
     }
 
     // Live tips: sensors and the ~1/s measurement run only while the screen is resumed.
-    val nightModeState = rememberUpdatedState(uiState.nightMode)
+    // Night or flash mode: the "too dark" tip is not needed.
+    val nightModeState = rememberUpdatedState(uiState.nightMode || uiState.flashMode)
     LaunchedEffect(request, lifecycleOwner) {
         val activeRequest = request ?: return@LaunchedEffect
         val secondary = activeRequest.secondaries.firstOrNull() ?: return@LaunchedEffect
@@ -169,7 +172,11 @@ fun CameraScreen(
         }
         scope.launch {
             // null means the request was ignored because a capture is already running.
-            val capture = controller.capture(activeRequest, burst = viewModel.burstFrames()) { lens ->
+            val capture = controller.capture(
+                activeRequest,
+                burst = viewModel.burstFrames(),
+                flash = viewModel.uiState.value.flashMode
+            ) { lens ->
                 viewModel.uiState.value.captureZoomFor(lens)
             } ?: return@launch
             if (capture.frames.isEmpty()) {
@@ -231,6 +238,9 @@ fun CameraScreen(
                             modifier = Modifier.align(Alignment.BottomStart).padding(12.dp)
                         )
                     }
+                    if (uiState.flashMode) {
+                        FlashBadge(Modifier.align(Alignment.BottomStart).padding(12.dp))
+                    }
                 }
                 if (uiState.pendingJobs > 0) {
                     PendingBadge(uiState.pendingJobs, Modifier.align(Alignment.BottomEnd).padding(12.dp))
@@ -242,12 +252,13 @@ fun CameraScreen(
         ShutterBar(
             busy = status.busy,
             night = uiState.nightMode,
+            flash = uiState.flashMode,
             burst = burstProgress,
             isCalibrating = uiState.isCalibrating,
             isCalibrated = uiState.isAutoZoomApplied,
             onCapture = ::startCapture,
             onCalibrate = ::startCalibration,
-            onToggleNight = { viewModel.setNightMode(context, !uiState.nightMode) },
+            onCycleLight = { viewModel.cycleLightMode(context) },
             onOpenGuide = viewModel::toggleGuide,
             onOpenSettings = viewModel::toggleSettings
         )
@@ -469,6 +480,33 @@ internal fun NightHoldOverlay(progress: CameraController.BurstProgress) {
 }
 
 private val NIGHT_BLUE = Color(0xFF8AB4FF)
+private val FLASH_YELLOW = Color(0xFFFFD54F)
+
+/** Badge on the live preview while flash mode is armed. */
+@Composable
+internal fun FlashBadge(modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier
+            .background(WiggleColors.OverlayStrong, RoundedCornerShape(20.dp))
+            .border(1.dp, FLASH_YELLOW, RoundedCornerShape(20.dp))
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            imageVector = Icons.Default.FlashOn,
+            contentDescription = "Blitz",
+            tint = FLASH_YELLOW,
+            modifier = Modifier.size(20.dp)
+        )
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(
+            text = "Blitz · Einweg-Look",
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold,
+            color = WiggleColors.TextPrimary
+        )
+    }
+}
 
 private fun formatSeconds(ms: Long): String = String.format(Locale.GERMANY, "%.1f s", ms / 1000.0)
 
@@ -502,12 +540,13 @@ private fun SideButton(
 internal fun ShutterBar(
     busy: Boolean,
     night: Boolean,
+    flash: Boolean,
     burst: CameraController.BurstProgress?,
     isCalibrating: Boolean,
     isCalibrated: Boolean,
     onCapture: () -> Unit,
     onCalibrate: () -> Unit,
-    onToggleNight: () -> Unit,
+    onCycleLight: () -> Unit,
     onOpenGuide: () -> Unit,
     onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier
@@ -541,16 +580,33 @@ internal fun ShutterBar(
                 )
             }
         }
+        // Light mode, cycling normal → night → flash: the two exclude each other.
         SideButton(
-            label = if (night) "Nacht an" else "Nacht",
-            enabled = burst == null,
-            background = if (night) NIGHT_BLUE else WiggleColors.SurfaceElevated,
-            onClick = onToggleNight
+            label = when {
+                night -> "Nacht"
+                flash -> "Blitz"
+                else -> "Licht"
+            },
+            enabled = burst == null && !busy,
+            background = when {
+                night -> NIGHT_BLUE
+                flash -> FLASH_YELLOW
+                else -> WiggleColors.SurfaceElevated
+            },
+            onClick = onCycleLight
         ) {
             Icon(
-                imageVector = Icons.Default.NightsStay,
-                contentDescription = "Nachtmodus",
-                tint = if (night) Color(0xFF0F1A33) else NIGHT_BLUE,
+                imageVector = when {
+                    night -> Icons.Default.NightsStay
+                    flash -> Icons.Default.FlashOn
+                    else -> Icons.Default.FlashOff
+                },
+                contentDescription = "Licht: normal, Nacht oder Blitz",
+                tint = when {
+                    night -> Color(0xFF0F1A33)
+                    flash -> Color(0xFF2B2000)
+                    else -> WiggleColors.TextSecondary
+                },
                 modifier = Modifier.size(22.dp)
             )
         }
@@ -564,6 +620,7 @@ internal fun ShutterBar(
                     when {
                         burst != null -> WiggleColors.SurfaceMuted // the progress ring is the border now
                         night -> NIGHT_BLUE
+                        flash -> FLASH_YELLOW
                         else -> WiggleColors.TextPrimary
                     },
                     CircleShape
@@ -594,6 +651,20 @@ internal fun ShutterBar(
                 busy -> {
                     Box(modifier = Modifier.size(60.dp).background(WiggleColors.SurfaceMuted, CircleShape))
                     CircularProgressIndicator(color = WiggleColors.Accent, modifier = Modifier.size(60.dp), strokeWidth = 3.dp)
+                }
+
+                flash -> {
+                    Box(
+                        modifier = Modifier.size(60.dp).background(FLASH_YELLOW, CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.FlashOn,
+                            contentDescription = "Blitzaufnahme",
+                            tint = Color(0xFF2B2000),
+                            modifier = Modifier.size(28.dp)
+                        )
+                    }
                 }
 
                 night -> {

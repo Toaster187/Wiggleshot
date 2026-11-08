@@ -17,6 +17,7 @@ object SettingsManager {
     private const val KEY_DENOISE = "denoise_secondary"
     private const val KEY_NIGHT = "night_mode"
     private const val KEY_DOF = "match_depth_of_field"
+    private const val KEY_FLASH = "flash_mode"
     private const val KEY_IN_BETWEEN = "in_between_frames"
 
     private const val TAG = "SettingsManager"
@@ -57,6 +58,10 @@ object SettingsManager {
     fun getNightMode(context: Context): Boolean = prefs(context).getBoolean(KEY_NIGHT, false)
 
     fun saveNightMode(context: Context, value: Boolean) = prefs(context).edit().putBoolean(KEY_NIGHT, value).apply()
+
+    fun getFlashMode(context: Context): Boolean = prefs(context).getBoolean(KEY_FLASH, false)
+
+    fun saveFlashMode(context: Context, value: Boolean) = prefs(context).edit().putBoolean(KEY_FLASH, value).apply()
 
     fun getDepthOfField(context: Context): Boolean = prefs(context).getBoolean(KEY_DOF, true)
 

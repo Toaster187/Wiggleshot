@@ -76,6 +76,9 @@ class RawCapture(
     /** How long the night burst took, i.e. how long the user had to hold still. */
     var burstDurationMs: Long = 0
 
+    /** Taken with the LED on (flash mode, disposable camera look). */
+    var flash: Boolean = false
+
     /** Night mode burst (more than one frame per lens). */
     val isBurst: Boolean get() = frames.any { it.frameCount > 1 }
 

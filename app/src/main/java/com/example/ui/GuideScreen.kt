@@ -113,6 +113,7 @@ fun GuideScreen(onBack: () -> Unit) {
             Tip("☀", "Viel Licht ist am besten – die 0,5×-Linse hat einen kleinen Sensor und wird 2,3× vergrößert.")
             Tip("☾", "Bei wenig Licht den Nachtmodus nutzen und ~1 s ruhig halten; kleine Wackler gleicht die App aus.")
             Tip("⚡", "Bewegte Motive (Menschen, Tiere) im normalen Modus fotografieren: beide Linsen lösen gleichzeitig aus.")
+            Tip("💥", "Blitz (Licht-Knopf zweimal tippen): Einwegkamera-Look – Motiv 0,5–1,5 m vor die Kamera, der Hintergrund versinkt im Dunkeln.")
             Tip("▶", "Abspielen: 120–200 ms pro Bild im Ping-Pong wirkt am natürlichsten.")
         }
         Spacer(modifier = Modifier.height(40.dp))

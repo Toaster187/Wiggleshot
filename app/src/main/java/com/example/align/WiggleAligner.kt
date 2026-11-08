@@ -45,7 +45,9 @@ class WiggleAligner(context: Context) {
         /** Give the ultra wide the main lens' depth of field ([LensBlur]). */
         val depthOfField: Boolean = true,
         /** In-between views between the two lenses ([ViewSynthesis]), 0 = off. */
-        val inBetweenFrames: Int = 2
+        val inBetweenFrames: Int = 2,
+        /** Taken with the flash: cheap disposable camera look ([FlashLook]). */
+        val flashLook: Boolean = false
     )
 
     /** Noise reduction of magnified secondary frames ([NoiseReducer]). */
@@ -264,17 +266,24 @@ class WiggleAligner(context: Context) {
             )
         }.toMutableList()
 
-        val primaryFinal = downscale(primaryOut, outFactor)
+        var primaryFinal = downscale(primaryOut, outFactor)
         val secondaryFinal = warpedFrames.map { downscale(it, outFactor) }.toMutableList()
-        val outFrames = mutableListOf(primaryFinal)
+        val focusDiopters = primary.metadata?.focusDistanceDiopters?.toDouble()
+        val inBetween = mutableListOf<Bitmap>()
+        var flashLit = false
         if (depth != null && secondaryFinal.size == 1) {
-            val finished = runCatching { finishDepth(primaryFinal, secondaryFinal[0], depth, settings) }
+            val finished = runCatching { finishDepth(primaryFinal, secondaryFinal[0], depth, settings, focusDiopters) }
                 .onFailure { Log.e(TAG, "Depth effects failed", it) }
                 .getOrNull()
             if (finished != null) {
                 secondaryFinal[0].recycle()
                 secondaryFinal[0] = finished.secondary
-                outFrames += finished.inBetween
+                finished.primary?.let { replacement ->
+                    primaryFinal.recycle()
+                    primaryFinal = replacement
+                }
+                flashLit = settings.flashLook
+                inBetween += finished.inBetween
                 finalReports[0] = finalReports[0].copy(
                     depthPivotShiftPx = depth.pivot * depth.cropPerMap,
                     focusFound = depth.focus != null,
@@ -290,7 +299,12 @@ class WiggleAligner(context: Context) {
                 )
             }
         }
+        val outFrames = mutableListOf(primaryFinal)
+        outFrames += inBetween
         outFrames += secondaryFinal
+        if (settings.flashLook) {
+            runCatching { styleFlash(outFrames, withDepth = flashLit) }.onFailure { Log.e(TAG, "Flash look failed", it) }
+        }
         finalReports.forEach { Log.d(TAG, "Lens ${it.lensId}: ${it.summary()} transform=${it.transform}") }
         return Output(outFrames, finalReports, crop)
     }
@@ -311,7 +325,14 @@ class WiggleAligner(context: Context) {
         val elapsedMs: Long
     )
 
-    private class DepthFinish(val secondary: Bitmap, val inBetween: List<Bitmap>, val maxBlur: Double?, val elapsedMs: Long)
+    private class DepthFinish(
+        /** Replacement for the primary frame, null if unchanged. */
+        val primary: Bitmap?,
+        val secondary: Bitmap,
+        val inBetween: List<Bitmap>,
+        val maxBlur: Double?,
+        val elapsedMs: Long
+    )
 
     private fun depthPrepass(
         primaryOut: Bitmap,
@@ -322,7 +343,7 @@ class WiggleAligner(context: Context) {
         settings: Settings
     ): DepthPrepass? {
         if (report.uncertain || report.source != Source.IMAGE) return null
-        val needed = settings.pivot != Pivot.BACKGROUND || settings.depthOfField || settings.inBetweenFrames > 0
+        val needed = settings.pivot != Pivot.BACKGROUND || settings.depthOfField || settings.inBetweenFrames > 0 || settings.flashLook
         if (!needed) return null
         val start = System.nanoTime()
         val geometryP = LensMetadata.geometry(cameraManager, report.primaryId)
@@ -374,7 +395,13 @@ class WiggleAligner(context: Context) {
         )
     }
 
-    private fun finishDepth(primary: Bitmap, secondary: Bitmap, depth: DepthPrepass, settings: Settings): DepthFinish? {
+    private fun finishDepth(
+        primary: Bitmap,
+        secondary: Bitmap,
+        depth: DepthPrepass,
+        settings: Settings,
+        focusDiopters: Double?
+    ): DepthFinish? {
         val start = System.nanoTime()
         val w = secondary.width
         val h = secondary.height
@@ -383,31 +410,58 @@ class WiggleAligner(context: Context) {
         val dP = depth.primary.minus(depth.pivot)
         val dS = depth.secondary.reReferenced(depth.pivot, depth.pivot)
         val scale = w.toDouble() / dP.width
-        var sPixels = IntArray(w * h).also { secondary.getPixels(it, 0, w, 0, 0, w, h) }
+        val focus = (depth.focus ?: depth.pivot) - depth.pivot
+        val sPixels0 = IntArray(w * h).also { secondary.getPixels(it, 0, w, 0, 0, w, h) }
+        var sPixels = sPixels0
+        var pPixels: IntArray? = null
+        fun primaryPixels(): IntArray = pPixels ?: IntArray(w * h).also { primary.getPixels(it, 0, w, 0, 0, w, h); pPixels = it }
+
         var maxBlur: Double? = null
-        var blurredBitmap: Bitmap? = null
         if (settings.depthOfField && depth.focus != null) {
-            LensBlur.apply(sPixels, w, h, dS, scale, depth.focus - depth.pivot, depth.blurRatio, depth.ownBlurRatio)?.let { (pixels, stats) ->
+            LensBlur.apply(sPixels, w, h, dS, scale, focus, depth.blurRatio, depth.ownBlurRatio)?.let { (pixels, stats) ->
                 sPixels = pixels
                 maxBlur = stats.maxDiameter
-                blurredBitmap = Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)
             }
+        }
+        // Flash light falls off with distance; done before the in-between views so every
+        // frame is lit the same way.
+        var primaryChanged = false
+        if (settings.flashLook) {
+            val diopters = focusDiopters?.takeIf { it > 0.05 } ?: DEFAULT_FLASH_FOCUS_DIOPTERS
+            if (sPixels === sPixels0) sPixels = sPixels0.copyOf()
+            FlashLook.falloff(primaryPixels(), w, h, dP, scale, focus, diopters)
+            FlashLook.falloff(sPixels, w, h, dS, scale, focus, diopters)
+            primaryChanged = true
         }
         val views = mutableListOf<Bitmap>()
         val count = settings.inBetweenFrames.coerceIn(0, 4)
         if (count > 0) {
-            val pPixels = IntArray(w * h).also { primary.getPixels(it, 0, w, 0, 0, w, h) }
             val occP = ViewSynthesis.occlusion(dP, dS, 1.0)
             val occS = ViewSynthesis.occlusion(dS, dP, -1.0)
             for (i in 1..count) {
                 val t = i / (count + 1.0)
-                val view = ViewSynthesis.render(t, pPixels, sPixels, w, h, dP, dS, occP, occS, scale)
+                val view = ViewSynthesis.render(t, primaryPixels(), sPixels, w, h, dP, dS, occP, occS, scale)
                 views += Bitmap.createBitmap(view, w, h, Bitmap.Config.ARGB_8888)
             }
         }
-        if (blurredBitmap == null && views.isEmpty()) return null
-        val finalSecondary = blurredBitmap ?: secondary.copy(Bitmap.Config.ARGB_8888, false)
-        return DepthFinish(finalSecondary, views, maxBlur, (System.nanoTime() - start) / 1_000_000)
+        if (sPixels === sPixels0 && views.isEmpty() && !primaryChanged) return null
+        val finalSecondary = Bitmap.createBitmap(sPixels, w, h, Bitmap.Config.ARGB_8888)
+        val finalPrimary = if (primaryChanged) Bitmap.createBitmap(primaryPixels(), w, h, Bitmap.Config.ARGB_8888) else null
+        return DepthFinish(finalPrimary, finalSecondary, views, maxBlur, (System.nanoTime() - start) / 1_000_000)
+    }
+
+    /** The disposable camera look on every frame (different grain per frame, like film). */
+    private fun styleFlash(frames: MutableList<Bitmap>, withDepth: Boolean) {
+        for (i in frames.indices) {
+            val b = frames[i]
+            val w = b.width
+            val h = b.height
+            val pixels = IntArray(w * h).also { b.getPixels(it, 0, w, 0, 0, w, h) }
+            if (!withDepth) FlashLook.falloffWithoutDepth(pixels, w, h)
+            val styled = FlashLook.style(pixels, w, h, seed = 17L + i)
+            b.recycle()
+            frames[i] = Bitmap.createBitmap(styled, w, h, Bitmap.Config.ARGB_8888)
+        }
     }
 
     /** Integer factor area downscale (keeps the two frames equally sharp, no aliasing). */
@@ -913,5 +967,8 @@ class WiggleAligner(context: Context) {
         const val DEFAULT_BASELINE_MM = 16.0
         const val DEFAULT_MAIN_APERTURE_MM = 6.9 / 1.68
         const val DEFAULT_UW_APERTURE_MM = 2.02 / 1.7
+
+        /** Assumed subject distance for the flash falloff if the focus distance is unknown (~0.8 m). */
+        const val DEFAULT_FLASH_FOCUS_DIOPTERS = 1.25
     }
 }

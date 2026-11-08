@@ -63,6 +63,10 @@ class CameraController(context: Context) {
          * aborts legitimate four lens captures or leaves the shutter blocked for too long.
          */
         private const val CAPTURE_TIMEOUT_BASE_MS = 8_000L
+
+        /** With the LED on, auto exposure needs a moment to adapt to the lit scene. */
+        private const val FLASH_MIN_SETTLE_MS = 250L
+        private const val FLASH_MAX_SETTLE_MS = 900L
         private const val CAPTURE_TIMEOUT_PER_LENS_MS = 5_000L
 
         /**
@@ -438,6 +442,8 @@ class CameraController(context: Context) {
         request: Request,
         /** Frames per lens; more than one is night mode (hold still, frames are averaged). */
         burst: Int = 1,
+        /** Light the scene with the LED (flash mode). */
+        flash: Boolean = false,
         zoomFor: (CameraLensDetails) -> Float
     ): RawCapture? {
         if (!lock.tryLock()) {
@@ -452,13 +458,14 @@ class CameraController(context: Context) {
             if (frames > 1) _burstProgress.value = BurstProgress(0, frames, burstStart, estimatedBurstMs(frames))
             val timeout = CAPTURE_TIMEOUT_BASE_MS + request.lenses.size * CAPTURE_TIMEOUT_PER_LENS_MS * frames
             withTimeoutOrNull(timeout) {
-                captureDual(request, frames)?.let { RawCapture(it, simultaneous = true) }
-                    ?: capturePair(request, zoomFor, frames)?.let { RawCapture(it, simultaneous = true) }
+                captureDual(request, frames, flash)?.let { RawCapture(it, simultaneous = true) }
+                    ?: withCameraXTorch(flash) { capturePair(request, zoomFor, frames) }?.let { RawCapture(it, simultaneous = true) }
                     ?: run {
                         needsReconfigure = true
-                        RawCapture(captureSequential(request, zoomFor, frames), simultaneous = false)
+                        RawCapture(withCameraXTorch(flash) { captureSequential(request, zoomFor, frames) }, simultaneous = false)
                     }
             }?.also { capture ->
+                capture.flash = flash
                 if (frames > 1 && capture.frames.isNotEmpty()) {
                     val elapsed = SystemClock.elapsedRealtime() - burstStart
                     capture.burstDurationMs = elapsed
@@ -478,12 +485,16 @@ class CameraController(context: Context) {
         }
     }
 
-    private suspend fun captureDual(request: Request, burst: Int): List<RawFrame>? {
+    private suspend fun captureDual(request: Request, burst: Int, flash: Boolean): List<RawFrame>? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
         val session = dualSession ?: return null
         val secondary = request.secondaries.singleOrNull() ?: return null
-        val pairs = session.captureBurst(burst) { done ->
-            if (burst > 1) reportBurst(done)
+        val torch = flash && session.setTorch(true)
+        val pairs = try {
+            if (torch) session.awaitExposure(FLASH_MIN_SETTLE_MS, FLASH_MAX_SETTLE_MS)
+            session.captureBurst(burst, { done -> if (burst > 1) reportBurst(done) }, torch = torch)
+        } finally {
+            if (torch) session.setTorch(false)
         }
         if (pairs.isNullOrEmpty()) {
             Log.w(TAG, "Dual capture returned nothing, falling back")
@@ -508,6 +519,19 @@ class CameraController(context: Context) {
                 pairs.drop(1).map { CameraImages.Jpeg(it.jpegB, rotationB) }
             )
         )
+    }
+
+    /** Runs [block] with the LED on through CameraX (paired / sequential modes). */
+    private suspend fun <T> withCameraXTorch(flash: Boolean, block: suspend () -> T): T {
+        val control = controlA
+        if (!flash || control == null) return block()
+        val on = runCatching { control.enableTorch(true).awaitResult() }.isSuccess
+        if (on) delay(FLASH_MIN_SETTLE_MS + 200)
+        return try {
+            block()
+        } finally {
+            if (on) runCatching { controlA?.enableTorch(false)?.awaitResult() }
+        }
     }
 
     private suspend fun capturePair(

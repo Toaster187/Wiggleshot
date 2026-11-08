@@ -75,7 +75,7 @@ object LiveGuide {
 
         val dark = (inputs.exposureMs ?: 0.0) >= DARK_EXPOSURE_MS || (inputs.iso ?: 0) >= DARK_ISO
         if (dark && !inputs.nightMode) {
-            tips += Tip("🌙", "Wenig Licht – Nachtmodus einschalten", Level.INFO)
+            tips += Tip("🌙", "Wenig Licht – Nacht- oder Blitzmodus", Level.INFO)
         }
         return tips.take(MAX_TIPS)
     }
